@@ -669,6 +669,41 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+
+    const int64_t ib  = i0 / QK_NVFP4;
+    const int     iqs = i0 % QK_NVFP4;
+
+    const int sub = iqs / QK_NVFP4_SUB;      // sub-block index (0..3)
+    const int pos = iqs % QK_NVFP4_SUB;      // position within sub-block (0..15)
+    const int byte_idx = (sub * QK_NVFP4_SUB + pos) / 2;  // byte index in qs array
+    const int nibble = pos % 2;              // 0 = low nibble, 1 = high nibble
+
+    // Scale for this sub-block (UE4M3)
+    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].d[sub]);
+
+    // Packed nibble
+    const uint8_t q_packed = x[ib].qs[byte_idx];
+    const int q = nibble == 0 ? (q_packed & 0xF) : (q_packed >> 4);
+
+    // E2M1 value (1 sign, 2 exp, 1 mantissa)
+    static constexpr float e2m1_lut[16] = {
+        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    const float val = e2m1_lut[q] * d;
+
+    if constexpr (std::is_same<T, half>::value) {
+        *((half *) dst) = __float2half_rn(val);
+    } else if constexpr (std::is_same<T, float>::value) {
+        *((float *) dst) = val;
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -711,6 +746,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_F8_E4M3) {
         return dequantize_V_f8_e4m3<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_NVFP4) {
+        return dequantize_V_nvfp4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

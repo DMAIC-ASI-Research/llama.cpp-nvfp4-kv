@@ -211,6 +211,73 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+static __device__ void quantize_f16_nvfp4_block(const half * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    // NVFP4 block: 64 elements = 4 sub-blocks of 16
+    // Each sub-block: 1 UE4M3 scale + 16 E2M1 values (packed 2 per byte)
+    
+    // Minimum scale to avoid UE4M3 underflow (min positive subnormal = 2^-9)
+    const float min_scale = 6.0f * 0.001953125f;  // 6.0 * 2^-9 = 0.01171875
+    
+    for (int sub = 0; sub < 4; ++sub) {
+        // Find amax in this sub-block
+        float amax = 0.0f;
+        const int base = sub * 16;
+        for (int j = 0; j < 16; ++j) {
+            const float v = __half2float(x[base + j]);
+            amax = fmaxf(amax, fabsf(v));
+        }
+        
+        // Scale: amax / 6.0 (max E2M1 value is 6.0), clamped to avoid UE4M3 underflow
+        const float scale_f32 = fmaxf(amax / 6.0f, 0.01171875f);
+        const uint8_t scale_ue4m3 = ggml_cuda_fp32_to_ue4m3(scale_f32);
+        y->d[sub] = scale_ue4m3;
+        
+        // Quantize 16 values to E2M1, pack 2 per byte
+        const float d = ggml_cuda_ue4m3_to_fp32(scale_ue4m3);
+        const float id = d ? 1.0f/d : 0.0f;
+        
+        for (int j = 0; j < 8; ++j) {
+            const float v0 = __half2float(x[base + j * 2 + 0]);
+            const float v1 = __half2float(x[base + j * 2 + 1]);
+            const uint8_t q0 = ggml_cuda_float_to_fp4_e2m1(v0, id);
+            const uint8_t q1 = ggml_cuda_float_to_fp4_e2m1(v1, id);
+            y->qs[sub * 8 + j] = q0 | (q1 << 4);
+        }
+    }
+}
+
+static __device__ void cpy_blck_f16_nvfp4(const char * cxi, char * cdsti) {
+    quantize_f16_nvfp4_block((const half *)cxi, (block_nvfp4 *)cdsti);
+}
+
+static __device__ void dequantize_nvfp4_f16_block(const block_nvfp4 * __restrict__ x, half * __restrict__ y) {
+    for (int sub = 0; sub < 4; ++sub) {
+        const float d = ggml_cuda_ue4m3_to_fp32(x->d[sub]);
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t q_packed = x->qs[sub * 8 + j];
+            const uint8_t q0 = q_packed & 0xF;
+            const uint8_t q1 = q_packed >> 4;
+
+            static constexpr float e2m1_lut[16] = {
+                0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+            };
+
+            y[sub * 16 + j * 2 + 0] = __float2half_rn(e2m1_lut[q0] * d);
+            y[sub * 16 + j * 2 + 1] = __float2half_rn(e2m1_lut[q1] * d);
+        }
+    }
+}
+
+static __device__ void cpy_blck_nvfp4_f16(const char * cxi, char * cdsti) {
+    dequantize_nvfp4_f16_block((const block_nvfp4 *)cxi, (half *)cdsti);
+}
+
+// Wrapper for set_rows_cuda_quant template (expects float* but we have half*)
+static __device__ void quantize_f32_nvfp4_block_wrapper(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    quantize_f16_nvfp4_block(reinterpret_cast<const half *>(x), y);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

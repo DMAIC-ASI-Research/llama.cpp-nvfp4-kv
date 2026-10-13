@@ -405,8 +405,9 @@ static __global__ void dequantize_block_nvfp4(
     const int64_t y0 = base + sub * QK_NVFP4_SUB + j;
     const int64_t y1 = y0 + QK_NVFP4_SUB / 2;
 
-    yy[y0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
-    yy[y1] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
+    // kvalues_mxfp4 (== kvalues_fp4) stores 2x E2M1 values; multiply by 0.5f to compensate
+    yy[y0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F] * 0.5f);
+    yy[y1] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q >> 4] * 0.5f);
 }
 
 template <typename dst_t>
