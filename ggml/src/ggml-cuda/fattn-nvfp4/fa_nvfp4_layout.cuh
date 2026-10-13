@@ -125,17 +125,22 @@ constexpr int STAGES          = 8;             // two stages in flight per consu
 constexpr int HEADS           = 8;             // MMA N: query heads per KV head, padded to 8
 constexpr int Q_TERMS         = 2;
 constexpr int MIN_CTAS_PER_SM = 1;             // one CTA per SM: measured faster than two, and no 168-register cap
+// A CTA serves up to MAX_GROUPS row groups of HEADS rows: its consumer warps form (row group x tile slot), and
+// the warps of one slot compute different row groups on the same shared-memory tile, so the KV cache is read
+// once per CTA instead of once per row group (multi-token decode, speculative verification).
+constexpr int MAX_GROUPS      = NCONSUMERS;
 
 struct alignas(128) Smem {
     uint8_t kv[STAGES][2][TILE_N][ROW_BYTES];      // raw ggml rows
-    uint8_t q[Q_TERMS][HEADS][ROW_BYTES];          // quantized Q (ggml layout, split-half nibbles)
     __half  p[NCONSUMERS][HEADS][TILE_N];          // P_loc hand-off per warp: S^T C-fragment layout -> PV B-fragment layout
-    float   q_alpha[HEADS];                        // per-head two-level Q factor
+    float   q_alpha[MAX_GROUPS * HEADS];               // per-row two-level Q factor
     uint64_t full[STAGES];
     uint64_t empty[STAGES];
 };
 static_assert(sizeof(Smem) + 1024 <= (100 * 1024) / MIN_CTAS_PER_SM, "decode smem exceeds the per-SM budget");
 static_assert((TILE_N * ROW_BYTES) % 128 == 0, "each TMA destination must stay 128-byte aligned");
+// Quantized Q of up to MAX_GROUPS row groups is staged in kv[] before the first TMA copy (Q_TERMS x rows x 144 B).
+static_assert(Q_TERMS * MAX_GROUPS * HEADS * ROW_BYTES <= (int) sizeof(((Smem *) nullptr)->kv), "Q staging alias");
 // Final cross-warp combine reuses kv[]: NCONSUMERS x (D x HEADS fp32 O^T + 2 x HEADS stats)
 static_assert(NCONSUMERS * (D * HEADS + 2 * HEADS) * 4 <= (int) sizeof(((Smem *) nullptr)->kv), "combine alias");
 } // namespace decode

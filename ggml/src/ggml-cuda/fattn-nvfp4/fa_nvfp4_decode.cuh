@@ -7,9 +7,11 @@
 //   O^T = V^T P'^T f8f6f4 m16n8k32,   A = raw V codes (16 d = one scale block), B = P' (E4M3) for 32 tokens
 // Rows (query token, head-in-group) are flattened like the prefill kernel and taken 8 at a time.
 //
-// CTA = 1 TMA producer warp + 4 consumer warps; tile i of the CTA's KV range goes to stage i % STAGES and
-// consumer warp i % 4. Each consumer keeps its own O^T and softmax state; the 4 are merged in shared memory
-// and the CTA writes one partial (O, base, l) per row. k_decode_combine merges the KV splits.
+// CTA = 1 TMA producer warp + 8 consumer warps serving ng = 1..8 row groups of 8 rows: warp w takes row group
+// w % ng and tile slot w / ng; tile i of the CTA's KV range goes to stage i % STAGES and slot i % (8 / ng), and
+// the ng warps of a slot share that tile, so the KV range is read once for all ng * 8 rows. Each warp keeps its
+// own O^T and softmax state; the slots of a row group are merged in shared memory and the CTA writes one
+// partial (O, base, l) per row. k_decode_combine merges the KV splits.
 // Two-level P as in the prefill kernel: per-tile base, O and l in units of exp2(base). P' is boosted by B = 2^k
 // per (warp, d-block), k = 14 - exponent of the largest V scale code the warp has seen so far: a tile with a
 // larger scale lowers k and rescales that d-block of O by the exact power of two. No prepass, no cache state.
@@ -38,11 +40,18 @@ struct Params {
     float     * part_o;            // [seq][kv head][row group][split][HEADS][D]
     float2    * part_al;           // [seq][kv head][row group][split][HEADS]: (base, l)
     int n_splits, tiles_per_split;
+    int groups_per_cta;            // row groups served by one CTA (1, 2, 4 or 8), set by launch()
     int   n_q, n_kv, n_head, n_head_kv, n_seq;
     float scale;
 };
 
 __host__ __device__ constexpr int n_row_groups(int n_q, int gqa) { return (n_q * gqa + HEADS - 1) / HEADS; }
+// Row groups per CTA, from a measured sweep (decode_test groups, 4k-106k caches). L2 already deduplicates CTAs
+// that read the same KV tile at the same time, so sharing a tile in shared memory only pays where one group per
+// CTA leaves too few KV splits to fill the GPU (about 6-32 row groups, i.e. 8-42 query tokens at GQA 6).
+__host__ __device__ constexpr int groups_per_cta(int ngrp) {
+    return ngrp <= 5 ? 1 : ngrp <= 8 ? 2 : ngrp <= 16 ? 4 : ngrp <= 32 ? MAX_GROUPS : 1;
+}
 
 static inline size_t workspace_bytes(int n_q, int n_head, int n_head_kv, int n_seq, int n_splits) {
     const size_t parts = (size_t) n_seq * n_head_kv * n_row_groups(n_q, n_head / n_head_kv) * n_splits * HEADS;
@@ -53,8 +62,23 @@ static inline size_t workspace_bytes(int n_q, int n_head, int n_head_kv, int n_s
 
 constexpr uint32_t STAGE_BYTES = 2 * TILE_N * ROW_BYTES;
 constexpr float    FLOOR_LOG2  = 32.0f;   // tile base never drops more than 2^32 below the running max
-constexpr int      BAR_CONSUMERS = 1;     // named barrier over the 4 consumer warps
+constexpr int      BAR_CONSUMERS = 1;     // named barrier over the consumer warps
+constexpr int      BAR_Q_FREE    = 2;     // consumers -> producer: Q fragments loaded, staging area free
+constexpr int      Q_STAGES      = 2;     // kv[] stages that hold the Q staging area
+static_assert(Q_STAGES * 2 * TILE_N * ROW_BYTES >= Q_TERMS * MAX_GROUPS * HEADS * ROW_BYTES, "Q staging does not fit");
 
+// bar.arrive: count this warp at the named barrier without waiting
+static __device__ __forceinline__ void named_bar_arrive(int id, int nthreads) {
+    asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(nthreads) : "memory");
+}
+// bar.sync issued by one lane of the producer warp: barriers count whole warps, so the elected lane's warp is
+// counted once; the fence orders the consumers' generic reads of the staging area before the next TMA writes.
+static __device__ __forceinline__ void named_bar_sync_warp0(int id, int nthreads) {
+    asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(nthreads) : "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
+template <int NG>   // row groups per CTA: 1, 2, 4 or MAX_GROUPS (compile-time so the 1-group case stays as tight as before)
 __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __grid_constant__ Params p) {
 #ifdef FA_NVFP4_AVAILABLE
     extern __shared__ __align__(128) uint8_t smem_raw[];
@@ -65,16 +89,22 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
     const int gqa    = p.n_head / p.n_head_kv;
     const int n_rows = p.n_q * gqa;
     const int ngrp   = n_row_groups(p.n_q, gqa);
-    const int split = blockIdx.x, grp = blockIdx.y % ngrp, kvh = blockIdx.y / ngrp, seq = blockIdx.z;
-    const int row0   = grp * HEADS;
+    constexpr int ng     = NG;                      // row groups in this CTA
+    constexpr int nslots = NCONSUMERS / NG;         // tile slots: tile i -> slot i % nslots
+    const int ncg    = (ngrp + ng - 1) / ng;        // CTA groups per kv head
+    const int split = blockIdx.x, cg = blockIdx.y % ncg, kvh = blockIdx.y / ncg, seq = blockIdx.z;
+    const int row0   = cg * ng * HEADS;             // first row of this CTA
+    const int lgrp   = warp % ng, slot = warp / ng; // consumer warp: local row group, tile slot
     const int n_t    = (p.n_kv + TILE_N - 1) / TILE_N;
     const int t_lo   = split * p.tiles_per_split;
     const int ntiles = max(0, min(n_t, t_lo + p.tiles_per_split) - t_lo);
 
-    // ---- Q: consumer warp w quantizes rows 2w, 2w+1 of this row group
+    // ---- Q: the consumer warps quantize the ng * HEADS rows of this CTA into a staging area that aliases the last
+    //      Q_STAGES stages of kv[], so the producer can fill the first stages while Q is still being read
+    uint8_t (*qst)[MAX_GROUPS * HEADS][ROW_BYTES] =
+        reinterpret_cast<uint8_t (*)[MAX_GROUPS * HEADS][ROW_BYTES]>(&sm.kv[STAGES - Q_STAGES][0][0][0]);
     if (warp < NCONSUMERS) {
-        for (int i = 0; i < HEADS / NCONSUMERS; ++i) {
-            const int r  = warp * (HEADS / NCONSUMERS) + i;
+        for (int r = warp; r < ng * HEADS; r += NCONSUMERS) {
             const int gr = row0 + r;
             const float * qrow = nullptr;
             if (gr < n_rows) {
@@ -82,23 +112,29 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
                 qrow = reinterpret_cast<const float *>(reinterpret_cast<const char *>(p.Q) + seq * p.nbq3 + h * p.nbq2 +
                                                        tok * p.nbq1);
             }
-            quantize_q_row(qrow, sm.q[0][r], sm.q[1][r], &sm.q_alpha[r]);
+            quantize_q_row(qrow, qst[0][r], qst[1][r], &sm.q_alpha[r]);
         }
     }
     if (threadIdx.x == 0) {
         for (int s = 0; s < STAGES; ++s) {
             mbar_init(&sm.full[s], 1);
-            mbar_init(&sm.empty[s], 1);
+            mbar_init(&sm.empty[s], ng);   // released by the ng warps of the tile's slot
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
 
     if (warp == NCONSUMERS) {   // ---- TMA producer
+        // The Q staging area is the last Q_STAGES stages: wait for the consumers' release before the first copy
+        // into them (always, so that the barrier completes even for short ranges).
+        const int i_q = min(ntiles, STAGES - Q_STAGES);
         if (lane == 0) {
             const bool tok_first = p.tm_tok_dim == 1;
             for (int i = 0; i < ntiles; ++i) {
                 const int st = i % STAGES;
+                if (i == i_q) {
+                    named_bar_sync_warp0(BAR_Q_FREE, NTHREADS);
+                }
                 if (i >= STAGES) {
                     mbar_wait(&sm.empty[st], ((i / STAGES) - 1) & 1);
                 }
@@ -107,6 +143,9 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
                 mbar_arrive_expect_tx(&sm.full[st], STAGE_BYTES);
                 tma_load_4d(sm.kv[st][0][0], &p.tm_k, 0, c1, c2, seq, &sm.full[st]);
                 tma_load_4d(sm.kv[st][1][0], &p.tm_v, 0, c1, c2, seq, &sm.full[st]);
+            }
+            if (ntiles <= i_q) {
+                named_bar_sync_warp0(BAR_Q_FREE, NTHREADS);
             }
         }
         return;
@@ -118,21 +157,23 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
     for (int term = 0; term < Q_TERMS; ++term) {
 #pragma unroll
         for (int b = 0; b < BLOCKS_PER_ROW; ++b) {
-            qb[term][b][0] = ld_s32(&sm.q[term][g][qs_word(b, t)]);
-            qb[term][b][1] = ld_s32(&sm.q[term][g][qs_word(b, 4 + t)]);
-            qsf[term][b]   = ld_s32(&sm.q[term][g][sf_word(b)]);
+            qb[term][b][0] = ld_s32(&qst[term][lgrp * HEADS + g][qs_word(b, t)]);
+            qb[term][b][1] = ld_s32(&qst[term][lgrp * HEADS + g][qs_word(b, 4 + t)]);
+            qsf[term][b]   = ld_s32(&qst[term][lgrp * HEADS + g][sf_word(b)]);
         }
     }
     float rs[2];
     const half * mrow[2] = {nullptr, nullptr};
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
-        const int h = 2 * t + c;
-        rs[c] = sm.q_alpha[h] * p.scale * LOG2E;
+        const int r = lgrp * HEADS + 2 * t + c;   // row of this CTA
+        rs[c] = sm.q_alpha[r] * p.scale * LOG2E;
         if (p.mask) {
-            mrow[c] = p.mask + seq * p.mask_s3 + (size_t) (min(row0 + h, n_rows - 1) / gqa) * p.mask_s1;
+            mrow[c] = p.mask + seq * p.mask_s3 + (size_t) (min(row0 + r, n_rows - 1) / gqa) * p.mask_s1;
         }
     }
+    named_bar_arrive(BAR_Q_FREE, NTHREADS);   // release the Q staging area to the producer (non-blocking)
+
     // running B = 2^k per d-block, 4 bits each; k starts at 14 (the boost for an all-subnormal block)
     uint32_t bexp[2] = {0xEEEEEEEEu, 0xEEEEEEEEu};
 
@@ -143,7 +184,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
     }
     float M[2] = {-INFINITY, -INFINITY}, a[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
 
-    for (int i = warp; i < ntiles; i += NCONSUMERS) {
+    for (int i = slot; i < ntiles; i += nslots) {
         const int st  = i % STAGES;
         const int kv0 = (t_lo + i) * TILE_N;
 
@@ -324,25 +365,29 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
     }
     named_bar_sync(BAR_CONSUMERS, NCONSUMERS * 32);
 
-    const size_t part = (((size_t) seq * p.n_head_kv + kvh) * ngrp + grp) * p.n_splits + split;
-    for (int idx = threadIdx.x; idx < HEADS * D; idx += NCONSUMERS * 32) {
-        const int h = idx / D, d = idx % D;
+    // combine the nslots warps of each local row group; warp w serves group w % ng
+    for (int idx = threadIdx.x; idx < ng * HEADS * D; idx += NCONSUMERS * 32) {
+        const int lg = idx / (HEADS * D), h = (idx / D) % HEADS, d = idx % D;
+        const int grp = cg * ng + lg;   // global row group
+        if (grp >= ngrp) {
+            break;
+        }
         float amax = -INFINITY;
-#pragma unroll
-        for (int w = 0; w < NCONSUMERS; ++w) {
-            amax = fmaxf(amax, comb_al[w * HEADS + h].x);
+        for (int s = 0; s < nslots; ++s) {
+            amax = fmaxf(amax, comb_al[(s * ng + lg) * HEADS + h].x);
         }
         float acc = 0.0f, lsum = 0.0f;
         if (amax != -INFINITY) {
-#pragma unroll
-            for (int w = 0; w < NCONSUMERS; ++w) {
+            for (int s = 0; s < nslots; ++s) {
+                const int    w  = s * ng + lg;
                 const float2 al = comb_al[w * HEADS + h];
                 const float  f  = al.x == -INFINITY ? 0.0f : fast_exp2(al.x - amax);
                 acc  += f * comb_o[(w * HEADS + h) * D + d];
                 lsum += f * al.y;
             }
         }
-        p.part_o[part * HEADS * D + idx] = acc;
+        const size_t part = (((size_t) seq * p.n_head_kv + kvh) * ngrp + grp) * p.n_splits + split;
+        p.part_o[part * HEADS * D + h * D + d] = acc;
         if (d == 0) {
             p.part_al[part * HEADS + h] = make_float2(amax, lsum);
         }
@@ -387,9 +432,11 @@ __global__ void __launch_bounds__(D) k_decode_combine(const __grid_constant__ Pa
 
 // Split count for the device: at most one wave of CTAs (one per SM), and at least ~12 tiles per split (measured: fewer,
 // longer splits win at every cache length; extra splits only add per-CTA setup and merge work).
-static inline int choose_splits(int n_kv, int n_q, int n_head, int n_head_kv, int n_seq, int n_sms) {
+static inline int choose_splits(int n_kv, int n_q, int n_head, int n_head_kv, int n_seq, int n_sms, int ng = 0) {
     const int n_t   = (n_kv + TILE_N - 1) / TILE_N;
-    const int other = n_head_kv * n_row_groups(n_q, n_head / n_head_kv) * n_seq;
+    const int ngrp  = n_row_groups(n_q, n_head / n_head_kv);
+    ng = ng > 0 ? ng : groups_per_cta(ngrp);
+    const int other = n_head_kv * ((ngrp + ng - 1) / ng) * n_seq;
     int s = MIN_CTAS_PER_SM * n_sms / other;   // round down: one extra CTA would start a second wave
     s = s > n_t / 12 ? n_t / 12 : s;
     return s < 1 ? 1 : s;
@@ -402,6 +449,10 @@ static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream
     const int gqa  = p.n_head / p.n_head_kv;
     const int ngrp = n_row_groups(p.n_q, gqa);
     const int n_t  = (p.n_kv + TILE_N - 1) / TILE_N;
+    p.groups_per_cta  = p.groups_per_cta > 0 ? p.groups_per_cta : groups_per_cta(ngrp);   // > 0: caller's choice
+    if (p.groups_per_cta != 1 && p.groups_per_cta != 2 && p.groups_per_cta != 4 && p.groups_per_cta != MAX_GROUPS) {
+        return cudaErrorInvalidValue;
+    }
     p.tiles_per_split = (n_t + p.n_splits - 1) / p.n_splits;
     p.n_splits        = (n_t + p.tiles_per_split - 1) / p.tiles_per_split;
 
@@ -423,11 +474,14 @@ static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream
         return err;
     }
 
-    err = cudaFuncSetAttribute(k_decode, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
+    void (*kern)(Params) = p.groups_per_cta == 1 ? k_decode<1> : p.groups_per_cta == 2 ? k_decode<2> :
+                           p.groups_per_cta == 4 ? k_decode<4> : k_decode<MAX_GROUPS>;
+    err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
     if (err != cudaSuccess) {
         return err;
     }
-    k_decode<<<dim3(p.n_splits, p.n_head_kv * ngrp, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p);
+    const int ncg = (ngrp + p.groups_per_cta - 1) / p.groups_per_cta;
+    kern<<<dim3(p.n_splits, p.n_head_kv * ncg, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p);
     k_decode_combine<<<dim3(p.n_head_kv * ngrp, p.n_seq), D, 0, stream>>>(p);
     return cudaGetLastError();
 }
