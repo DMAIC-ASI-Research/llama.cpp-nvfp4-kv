@@ -254,25 +254,14 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     const int vt_off = vt_b * BLOCK_BYTES + 4 + ((dgrp >> 1) & 3) * 8 + 4 * (dgrp & 1);
     const int vt_d   = vt_b * QK + ((dgrp >> 1) & 3) * QK_SUB + 4 * (dgrp & 1);
 
-    int T = next_tile(0);
-    for (int it = 0; T < n_t; ++it) {
-        const int  kv0    = T * BLOCK_N;
-        const bool mixed  = tile_state(T) == TILE_MIXED;
-        const int  T_next = next_tile(T + 1);   // issued early, consumed at the end of the iteration
-        const int  st    = it % STAGES;
-        mbar_wait(&sm.full[st], (it / STAGES) & 1);
-        const uint8_t * Ks = sm.kv[st][0][0];
-        const uint8_t * Vs = sm.kv[st][1][0];
-
-        // ---- V^T staging for this d-half, both k32 steps: raw nibbles -> e2m1 byte containers,
-        //      token-permuted, in vt_offset order. Published by the named barrier before the PV product.
+    auto stage_vt = [&](const uint8_t * Vsrc, const int buf) {   // V^T staging for this d-half, both k32 steps
 #pragma unroll
         for (int kk = 0; kk < 2; ++kk) {
-            uint8_t * vt = sm.vt[it & 1][kk][0];
+            uint8_t * vt = sm.vt[buf][kk][0];
             uint32_t lo[4], hi[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const uint32_t x = ld_s32(Vs + pv_phys_token(kk, 4 * tq + i) * ROW_BYTES + vt_off);
+                const uint32_t x = ld_s32(Vsrc + pv_phys_token(kk, 4 * tq + i) * ROW_BYTES + vt_off);
                 lo[i] = fp4_lo_to_f8f6f4(x);
                 hi[i] = fp4_hi_to_f8f6f4(x);
             }
@@ -294,25 +283,45 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             }
         }
 
-        // ---- S = Q K^T for this warp's k32 half (16 rows x 32 tokens: n-tiles 4*dh .. 4*dh+3), raw K rows as B
-        constexpr int NJ = BLOCK_N / 16;   // 4 n-tiles per half
+    };
+
+    // S = Q K^T for this warp's k32 half (16 rows x 32 tokens: n-tiles 4*dh .. 4*dh+3), raw K rows as B.
+    // MMA number idx (0..31) = (term, k-block b, n-tile jj); issued in pieces so it can overlap the PV fold.
+    constexpr int NJ = BLOCK_N / 16;   // 4 n-tiles per half
+    auto s_mma = [&](float (&acc)[NJ][4], const uint8_t * Ksrc, const int idx) {
+        const int term = idx / (BLOCKS_PER_ROW * NJ), b = (idx / NJ) % BLOCKS_PER_ROW, jj = idx % NJ;
+        const uint8_t * krow = Ksrc + (32 * dh + g + 8 * jj) * ROW_BYTES;
+        const uint32_t bb[2] = {ld_s32(krow + qs_word(b, t)), ld_s32(krow + qs_word(b, 4 + t))};
+        mma_nvf4(acc[jj], qa[term][b], bb, qsf[term][b], ld_s32(krow + sf_word(b)));
+    };
+
+    // Software pipeline: S(t+1) and the V^T staging of tile t+1 run during the PV product of tile t.
+    float sn[NJ][4];   // S of the next tile
+    int T = next_tile(0);
+    if (T < n_t) {
+        mbar_wait(&sm.full[0], 0);
+        stage_vt(sm.kv[0][1][0], 0);
+#pragma unroll
+        for (int jj = 0; jj < NJ; ++jj) {
+            sn[jj][0] = sn[jj][1] = sn[jj][2] = sn[jj][3] = 0.0f;
+        }
+#pragma unroll
+        for (int idx = 0; idx < Q_TERMS * BLOCKS_PER_ROW * NJ; ++idx) {
+            s_mma(sn, sm.kv[0][0][0], idx);
+        }
+    }
+    for (int it = 0; T < n_t; ++it) {
+        const int  kv0    = T * BLOCK_N;
+        const bool mixed  = tile_state(T) == TILE_MIXED;
+        const int  T_next = next_tile(T + 1);
+        const int  st     = it % STAGES;
+        const uint8_t * Vs = sm.kv[st][1][0];
+
         float s[NJ][4];
 #pragma unroll
         for (int jj = 0; jj < NJ; ++jj) {
-            s[jj][0] = s[jj][1] = s[jj][2] = s[jj][3] = 0.0f;
-        }
-        const uint8_t * Kh = Ks + (32 * dh + g) * ROW_BYTES;
-#pragma unroll
-        for (int term = 0; term < Q_TERMS; ++term) {
-#pragma unroll
-            for (int b = 0; b < BLOCKS_PER_ROW; ++b) {
-#pragma unroll
-                for (int jj = 0; jj < NJ; ++jj) {
-                    const uint8_t * krow = Kh + 8 * jj * ROW_BYTES;
-                    const uint32_t bb[2] = {ld_s32(krow + qs_word(b, t)), ld_s32(krow + qs_word(b, 4 + t))};
-                    mma_nvf4(s[jj], qa[term][b], bb, qsf[term][b], ld_s32(krow + sf_word(b)));
-                }
-            }
+            s[jj][0] = sn[jj][0]; s[jj][1] = sn[jj][1]; s[jj][2] = sn[jj][2]; s[jj][3] = sn[jj][3];
+            sn[jj][0] = sn[jj][1] = sn[jj][2] = sn[jj][3] = 0.0f;
         }
 
         // ---- scale, mask (only on mixed tiles), half-tile row max
@@ -414,7 +423,20 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
 
         named_bar_sync(1 + dh, NWARPS * 32 / D_SPLIT);   // vt[it & 1] of this d-half is complete
 
-        // ---- O += P' V, one k32 step (32 permuted tokens) at a time: own half (kk = dh), then the partner's
+        // next tile: wait for its data and stage its V^T (buffer (it+1)&1 was last read by PV(t-1), which every
+        // warp of the group finished before the barrier above). Without a next tile the S MMAs below re-read the
+        // current stage and their result is discarded, so the PV loop stays branch-free.
+        const bool has_next = T_next < n_t;
+        const uint8_t * Kn = sm.kv[st][0][0];
+        if (has_next) {
+            const int st1 = (it + 1) % STAGES;
+            mbar_wait(&sm.full[st1], ((it + 1) / STAGES) & 1);
+            stage_vt(sm.kv[st1][1][0], (it + 1) & 1);
+            Kn = sm.kv[st1][0][0];
+        }
+
+        // ---- O += P' V, one k32 step (32 permuted tokens) at a time: own half (kk = dh), then the partner's.
+        //      The 32 S MMAs of the next tile are interleaved, two per d-block step.
 #pragma unroll
         for (int src = 0; src < 2; ++src) {
             const int kk = dh ^ src;
@@ -454,6 +476,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
                 }
 #pragma unroll
                 for (int n = 0; n < 2; ++n) {
+                    s_mma(sn, Kn, 2 * (8 * src + i) + n);   // S of the next tile, overlapped with this fold
                     const int nt = 2 * i + n;
                     const int d  = dh * D_PER_WARP + 8 * nt + g;
                     const uint2    bv    = *reinterpret_cast<const uint2 *>(vt + vt_offset(d, 4 * t));
