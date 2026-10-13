@@ -85,16 +85,20 @@ static __device__ __forceinline__ uint32_t ld_s32_g(const uint8_t * p) { return 
 // ------------------------------------------------------------------------------------------------
 // Q quantization: one warp, one 256-float row -> two FP4 terms in ggml split-half layout + row factor.
 // Lane l owns elements 8l..8l+7 (half of sub-block l/2). q == nullptr quantizes a zero row.
+// Head sizes below 256 (see heads_per_row): q is a row of 256 / hpr floats that fills segment `part` of the
+// 256-wide virtual row (lanes part * 32 / hpr ..), the other segments are zero.
 // ------------------------------------------------------------------------------------------------
-static __device__ __forceinline__ void quantize_q_row(const float * q, uint8_t * t0, uint8_t * t1, float * alpha_out) {
+static __device__ __forceinline__ void quantize_q_row(const float * q, uint8_t * t0, uint8_t * t1, float * alpha_out,
+                                                      const int hpr = 1, const int part = 0) {
     const int lane = threadIdx.x & 31;
     const int sb   = lane / 2;
     const int b    = sb / 4;
     const int s    = sb % 4;
+    const int lpp  = 32 / hpr;   // lanes per head segment
     float x[8];
-    if (q) {
-        const float4 v0 = reinterpret_cast<const float4 *>(q)[2 * lane];
-        const float4 v1 = reinterpret_cast<const float4 *>(q)[2 * lane + 1];
+    if (q && lane / lpp == part) {
+        const float4 v0 = reinterpret_cast<const float4 *>(q)[2 * (lane % lpp)];
+        const float4 v1 = reinterpret_cast<const float4 *>(q)[2 * (lane % lpp) + 1];
         x[0] = v0.x; x[1] = v0.y; x[2] = v0.z; x[3] = v0.w;
         x[4] = v1.x; x[5] = v1.y; x[6] = v1.z; x[7] = v1.w;
     } else {
@@ -174,6 +178,28 @@ __global__ void __launch_bounds__(256) k_v_scale_max(const uint8_t * V, const si
 // ------------------------------------------------------------------------------------------------
 // Host side
 // ------------------------------------------------------------------------------------------------
+// Head sizes 128 and 64: the kernels work on 144-byte rows (one 256-wide head). In ggml's KV cache the heads of
+// a token are adjacent, so hpr = 256 / head_dim consecutive KV heads form one 144-byte virtual row, and their
+// query heads are consecutive too (GQA maps query head h to KV head h / gqa). Each query row is quantized into
+// its own head's segment of the virtual row with zeros elsewhere, so S and P are exact per head; the output
+// keeps only the head's segment of the 256 columns. Returns 0 for unsupported head sizes.
+__host__ __device__ constexpr int heads_per_row(int head_dim) {
+    return head_dim == 0 || head_dim == D ? 1 : head_dim == D / 2 ? 2 : head_dim == D / 4 ? 4 : 0;
+}
+// Whether a K or V view of head size head_dim can be read as virtual rows: whole groups of hpr heads, heads
+// adjacent within a token, and 16-byte aligned base and strides (TMA).
+static inline bool kv_view_supported(int head_dim, const void * base, size_t nb1, size_t nb2, size_t nb3, int n_head_kv) {
+    const int hpr = heads_per_row(head_dim);
+    if (hpr == 0 || n_head_kv % hpr != 0 || (reinterpret_cast<uintptr_t>(base) & 15) != 0) {
+        return false;
+    }
+    const size_t head_stride = hpr == 1 ? nb2 : nb2 * hpr;   // virtual row stride
+    if (hpr > 1 && nb2 != (size_t) (ROW_BYTES / hpr)) {
+        return false;
+    }
+    return nb1 % 16 == 0 && head_stride % 16 == 0 && nb3 % 16 == 0;
+}
+
 // 4-D u8 tensor map over one K or V view: dim 0 = the 144 bytes of a head row, dims 1, 2 = token and
 // kv head ordered by increasing stride, dim 3 = sequence. Box = box_rows tokens of one head.
 static inline cudaError_t encode_kv_map(CUtensorMap * tm, const uint8_t * base, size_t nb1, size_t nb2, size_t nb3,

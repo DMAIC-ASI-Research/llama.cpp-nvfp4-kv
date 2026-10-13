@@ -12974,6 +12974,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 0, softcap, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
         }
     }
+    // NVFP4 KV cache, head sizes 128 (Llama-3 32/8, Qwen2.5 28/4) and 64 (GPT-OSS 64/8): permuted {0, 2, 1, 3} puts
+    // the KV heads of a token next to each other as in llama.cpp's cache, which the native kernels require
+    for (int nb : {1, 3, 75, 300}) {
+        for (float softcap : {0.0f, 30.0f}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, nb, true, false, 0, softcap, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, {0, 2, 1, 3}));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {7, 1}, 512, nb, true, false, 0, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 512, nb, true, false, 0, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, {0, 2, 1, 3}));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));

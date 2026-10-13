@@ -60,6 +60,10 @@ struct Params {
     int   n_q, n_kv, n_head, n_head_kv, n_seq;
     float scale;
     float softcap;                 // 0 = off; else logits become softcap * tanh(scale * q.k / softcap) (Gemma 2)
+    // head size of Q, K, V and dst: 256, 128 or 64 (0 = 256). Below 256, launch() regroups heads_per_row(head_dim)
+    // adjacent KV heads into one virtual 144-byte row (kv_view_supported() must hold for K and V).
+    int   head_dim;
+    int   hpr;                     // set by launch(): heads per virtual row; n_head_kv and nbk2 / nbv2 are virtual
 };
 
 // tile states: fully masked (not visited), unmasked (mask all zero, not loaded), mixed (mask applied per element)
@@ -69,7 +73,8 @@ __host__ __device__ constexpr int n_row_blocks(int n_q, int gqa) { return (n_q *
 __host__ __device__ constexpr int n_kv_tiles(int n_kv) { return (n_kv + BLOCK_N - 1) / BLOCK_N; }
 
 // Device scratch for launch(), carved from one allocation of workspace_bytes().
-static inline size_t workspace_bytes(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq) {
+static inline size_t workspace_bytes(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq, int head_dim = D) {
+    n_head_kv /= heads_per_row(head_dim);
     const size_t nblk = (size_t) n_row_blocks(n_q, n_head / n_head_kv) * n_seq;
     const size_t states = (nblk * n_kv_tiles(n_kv) + 15) / 16 * 16;
     return states + (size_t) n_seq * n_head_kv * DBLKS * sizeof(int);
@@ -131,7 +136,9 @@ constexpr float FLOOR_LOG2 = 32.0f;   // tile base never drops more than 2^32 be
 constexpr int   BAR_Q_FREE = 3;
 constexpr int   BAR_PAIR0  = 4;
 
-template <bool CAP>   // logit softcap compiled in or out, so the common no-cap kernel is unchanged
+// CAP: logit softcap compiled in or out; HPR: heads per virtual row (1, 2, 4), compile-time so the D = 256 kernel
+// is unchanged by the head-size support
+template <bool CAP, int HPR>
 __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __grid_constant__ Params p) {
 #ifdef FA_NVFP4_AVAILABLE
     extern __shared__ __align__(128) uint8_t smem_raw[];
@@ -143,9 +150,18 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     const int dh = warp % D_SPLIT;   // O columns 128*dh .. 128*dh+127
     const int blk = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
     const int gqa    = p.n_head / p.n_head_kv;
-    const int n_rows = p.n_q * gqa;
-    const int row0   = blk * BLOCK_M;
     const int n_t    = n_kv_tiles(p.n_kv);
+    // Head sizes below 256 (HPR > 1): row group rg serves only head segment part = rg % HPR of the virtual row, so
+    // its S skips the other segments' k64 blocks and its two warps split that segment's DR columns of O. Rows of a
+    // segment are (token, head of the real GQA group) pairs, q = token * G + head; a block holds RPB of each segment.
+    constexpr int DR   = D / HPR;                  // real head size
+    constexpr int BPP  = BLOCKS_PER_ROW / HPR;     // k64 blocks per segment
+    constexpr int DPW  = DR / D_SPLIT;             // O columns per warp
+    constexpr int RPB  = BLOCK_M / HPR;            // rows of one segment per block
+    const int     G    = gqa / HPR;                // query heads per real KV head
+    const int     part = rg % HPR;
+    const int     n_rows = p.n_q * G;              // rows per segment
+    const int     cb   = part * DR + dh * DPW;     // first virtual O column of this warp
     // The producer and the MMA warps walk the same tile sequence: every tile whose state is not TILE_SKIP.
     const uint8_t * tstate = p.tile_state ? p.tile_state + ((size_t) seq * gridDim.x + blk) * n_t : nullptr;
     auto tile_state = [&](const int T) -> int {
@@ -166,14 +182,14 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     float * q_alpha = reinterpret_cast<float *>(&sm.vt[0][0][0][0]);
     for (int i = 0; i < (warp < NWARPS ? BLOCK_M / NWARPS : 0); ++i) {
         const int r  = warp * (BLOCK_M / NWARPS) + i;
-        const int gr = row0 + r;
+        const int q = blk * RPB + (r / 16 / HPR) * 16 + r % 16, qpart = (r / 16) % HPR;
         const float * qrow = nullptr;
-        if (gr < n_rows) {
-            const int tok = gr / gqa, h = kvh * gqa + gr % gqa;
+        if (q < n_rows) {
+            const int tok = q / G, h = (kvh * HPR + qpart) * G + q % G;
             qrow = reinterpret_cast<const float *>(reinterpret_cast<const char *>(p.Q) + seq * p.nbq3 + h * p.nbq2 +
                                                    tok * p.nbq1);
         }
-        quantize_q_row(qrow, qst[0][r], qst[1][r], &q_alpha[r]);
+        quantize_q_row(qrow, qst[0][r], qst[1][r], &q_alpha[r], HPR, qpart);
     }
     if (threadIdx.x == 0) {
         for (int s = 0; s < STAGES; ++s) {
@@ -207,17 +223,18 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     }
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(CONSUMER_REGS));
 
-    uint32_t qa[Q_TERMS][BLOCKS_PER_ROW][4], qsf[Q_TERMS][BLOCKS_PER_ROW];
+    uint32_t qa[Q_TERMS][BPP][4], qsf[Q_TERMS][BPP];   // the k64 blocks of this row group's segment
     const int lr0 = 16 * rg + g, lr1 = lr0 + 8;   // local rows of this thread's C fragments
 #pragma unroll
     for (int term = 0; term < Q_TERMS; ++term) {
 #pragma unroll
-        for (int b = 0; b < BLOCKS_PER_ROW; ++b) {
-            qa[term][b][0] = ld_s32(&qst[term][lr0][qs_word(b, t)]);
-            qa[term][b][1] = ld_s32(&qst[term][lr1][qs_word(b, t)]);
-            qa[term][b][2] = ld_s32(&qst[term][lr0][qs_word(b, 4 + t)]);
-            qa[term][b][3] = ld_s32(&qst[term][lr1][qs_word(b, 4 + t)]);
-            qsf[term][b]   = ld_s32(&qst[term][16 * rg + sfa_row(lane)][sf_word(b)]);
+        for (int bl = 0; bl < BPP; ++bl) {
+            const int b = part * BPP + bl;
+            qa[term][bl][0] = ld_s32(&qst[term][lr0][qs_word(b, t)]);
+            qa[term][bl][1] = ld_s32(&qst[term][lr1][qs_word(b, t)]);
+            qa[term][bl][2] = ld_s32(&qst[term][lr0][qs_word(b, 4 + t)]);
+            qa[term][bl][3] = ld_s32(&qst[term][lr1][qs_word(b, 4 + t)]);
+            qsf[term][bl]   = ld_s32(&qst[term][16 * rg + sfa_row(lane)][sf_word(b)]);
         }
     }
     // S row factor (log2 domain); with a softcap the factor feeds tanh and softcap * LOG2E scales its output
@@ -226,37 +243,44 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     const float rs0 = q_alpha[lr0] * p.scale * (has_cap ? 1.0f / p.softcap : LOG2E);
     const float rs1 = q_alpha[lr1] * p.scale * (has_cap ? 1.0f / p.softcap : LOG2E);
 
-    const int   gr0 = row0 + lr0, gr1 = row0 + lr1;
+    const int   gr0 = blk * RPB + (rg / HPR) * 16 + g, gr1 = gr0 + 8;   // segment rows of the C fragments
     const half * mrow0 = nullptr, * mrow1 = nullptr;
     if (p.mask) {
-        mrow0 = p.mask + seq * p.mask_s3 + (size_t) (min(gr0, n_rows - 1) / gqa) * p.mask_s1;
-        mrow1 = p.mask + seq * p.mask_s3 + (size_t) (min(gr1, n_rows - 1) / gqa) * p.mask_s1;
+        mrow0 = p.mask + seq * p.mask_s3 + (size_t) (min(gr0, n_rows - 1) / G) * p.mask_s1;
+        mrow1 = p.mask + seq * p.mask_s3 + (size_t) (min(gr1, n_rows - 1) / G) * p.mask_s1;
     }
     // B = 2^k per local d-block: k = 14 - exponent(max code) puts max(sV) * B in (120, 240]
     uint32_t bexp = 0;   // 8 x 4-bit k (k in -1..14 stored as k + 1)
     {
-        const int * vmax = p.v_scale_max + (seq * p.n_head_kv + kvh) * DBLKS + dh * (D_PER_WARP / QK_SUB);
+        const int * vmax = p.v_scale_max + (seq * p.n_head_kv + kvh) * DBLKS + cb / QK_SUB;
 #pragma unroll
-        for (int i = 0; i < D_PER_WARP / QK_SUB; ++i) {
+        for (int i = 0; i < DPW / QK_SUB; ++i) {
             bexp |= (uint32_t) (14 - (__ldg(vmax + i) >> 3) + 1) << (4 * i);
         }
     }
     named_bar_sync(BAR_Q_FREE, NTHREADS);   // release the Q staging area to the producer
 
 
-    float o[D_PER_WARP / 8][4];
+    float o[DPW / 8][4];
 #pragma unroll
-    for (int nt = 0; nt < D_PER_WARP / 8; ++nt) {
+    for (int nt = 0; nt < DPW / 8; ++nt) {
         o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
     }
     // per row: running max M, current tile base a (O and l are in units of exp2(a)), l
     float M0 = -INFINITY, M1 = -INFINITY, a0 = -INFINITY, a1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
 
-    // V^T staging work item of this thread inside its d-half group (128 threads): 8 d x 4 logical tokens.
-    // Warp rg takes d-groups 4rg..4rg+3 (one per 8-lane quarter r), lane & 7 the token quad.
+    // V^T staging: the warps that read a column range stage it, then sync on that group's barrier. Groups: the
+    // d-half dh (HPR 1, 4 warps) or the segment part (HPR 2: 4 warps, HPR 4: 2 warps). Work item of a thread:
+    // 8 d x 4 logical tokens; warp sj of the group takes d-groups 4sj..4sj+3 (one per 8-lane quarter vt_r), lane & 7
+    // the token quad.
+    constexpr int NSG     = HPR == 1 ? D_SPLIT : HPR;      // staging groups
+    constexpr int SG_THR  = NWARPS * 32 / NSG;
+    const int     sgrp    = HPR == 1 ? dh : part;
+    const int     sj      = HPR == 1 ? rg : HPR == 2 ? (rg / 2) * 2 + dh : dh;
+    const int     vt_bar  = HPR < 4 ? 1 + sgrp : sgrp < 2 ? 1 + sgrp : 6 + sgrp;   // named barriers 1, 2, 8, 9
     const int vt_r = lane >> 3, tq = lane & 7;
-    const int dgrp = 4 * rg + vt_r;
-    const int vt_b   = 2 * dh + (dgrp >> 3);
+    const int dgrp = sgrp * (32 / NSG) + 4 * sj + vt_r;     // 8-wide virtual d-group, 0..31
+    const int vt_b   = dgrp >> 3;
     const int vt_off = vt_b * BLOCK_BYTES + 4 + ((dgrp >> 1) & 3) * 8 + 4 * (dgrp & 1);
     const int vt_d   = vt_b * QK + ((dgrp >> 1) & 3) * QK_SUB + 4 * (dgrp & 1);
 
@@ -294,11 +318,13 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     // S = Q K^T for this warp's k32 half (16 rows x 32 tokens: n-tiles 4*dh .. 4*dh+3), raw K rows as B.
     // MMA number idx (0..31) = (term, k-block b, n-tile jj); issued in pieces so it can overlap the PV fold.
     constexpr int NJ = BLOCK_N / 16;   // 4 n-tiles per half
+    constexpr int N_SMMA = Q_TERMS * BPP * NJ;
     auto s_mma = [&](float (&acc)[NJ][4], const uint8_t * Ksrc, const int idx) {
-        const int term = idx / (BLOCKS_PER_ROW * NJ), b = (idx / NJ) % BLOCKS_PER_ROW, jj = idx % NJ;
+        const int term = idx / (BPP * NJ), bl = (idx / NJ) % BPP, jj = idx % NJ;
+        const int b = part * BPP + bl;
         const uint8_t * krow = Ksrc + (32 * dh + g + 8 * jj) * ROW_BYTES;
         const uint32_t bb[2] = {ld_s32(krow + qs_word(b, t)), ld_s32(krow + qs_word(b, 4 + t))};
-        mma_nvf4(acc[jj], qa[term][b], bb, qsf[term][b], ld_s32(krow + sf_word(b)));
+        mma_nvf4(acc[jj], qa[term][bl], bb, qsf[term][bl], ld_s32(krow + sf_word(b)));
     };
 
     // Software pipeline: S(t+1) and the V^T staging of tile t+1 run during the PV product of tile t.
@@ -312,7 +338,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             sn[jj][0] = sn[jj][1] = sn[jj][2] = sn[jj][3] = 0.0f;
         }
 #pragma unroll
-        for (int idx = 0; idx < Q_TERMS * BLOCKS_PER_ROW * NJ; ++idx) {
+        for (int idx = 0; idx < N_SMMA; ++idx) {
             s_mma(sn, sm.kv[0][0][0], idx);
         }
     }
@@ -425,7 +451,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
         l0 = l0 * R0 + ls0;
         l1 = l1 * R1 + ls1;
 #pragma unroll
-        for (int nt = 0; nt < D_PER_WARP / 8; ++nt) {
+        for (int nt = 0; nt < DPW / 8; ++nt) {
             o[nt][0] *= R0;
             o[nt][1] *= R0;
             o[nt][2] *= R1;
@@ -439,7 +465,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             ph_oth[jj][1] = *reinterpret_cast<const __half2 *>(&w1);
         }
 
-        named_bar_sync(1 + dh, NWARPS * 32 / D_SPLIT);   // vt[it & 1] of this d-half is complete
+        named_bar_sync(vt_bar, SG_THR);   // vt[it & 1] of this warp's columns is complete
 
         // next tile: wait for its data and stage its V^T (buffer (it+1)&1 was last read by PV(t-1), which every
         // warp of the group finished before the barrier above). Without a next tile the S MMAs below re-read the
@@ -461,14 +487,16 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             const __half2 (&ph)[NJ][2] = src ? ph_oth : ph_own;
             const uint8_t * vt = sm.vt[it & 1][kk][0];
             // V scale words of this thread's 8 tokens (q = 2kk + ql; tokens 16q + 2t + {0, 1, 8, 9})
-            // for the two 64-wide blocks of this d-half; byte i of a word = d-block 4*block + i.
-            uint32_t sw[2][2][4];
+            // for the 64-wide blocks of this warp's columns; byte i of a word = d-block 4*block + i.
+            constexpr int NDB = DPW / QK_SUB;               // local d-blocks
+            constexpr int NBL = NDB >= 4 ? NDB / 4 : 1;     // 64-wide blocks they touch
+            uint32_t sw[2][NBL][4];
 #pragma unroll
             for (int ql = 0; ql < 2; ++ql) {
                 const int tk0 = 16 * (2 * kk + ql) + 2 * t;
 #pragma unroll
-                for (int bl = 0; bl < 2; ++bl) {
-                    const int off = sf_word(2 * dh + bl);
+                for (int bl = 0; bl < NBL; ++bl) {
+                    const int off = sf_word(part * BPP + (dh * DPW) / QK + bl);   // block of column cb
                     sw[ql][bl][0] = ld_s32(Vs + (tk0) * ROW_BYTES + off);
                     sw[ql][bl][1] = ld_s32(Vs + (tk0 + 1) * ROW_BYTES + off);
                     sw[ql][bl][2] = ld_s32(Vs + (tk0 + 8) * ROW_BYTES + off);
@@ -476,8 +504,8 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
                 }
             }
 #pragma unroll
-            for (int i = 0; i < D_PER_WARP / QK_SUB; ++i) {   // 8 local d-blocks
-                const int bl = i / 4, bi = i % 4;
+            for (int i = 0; i < NDB; ++i) {   // local d-blocks (8 at HPR 1)
+                const int bl = i / 4, bi = HPR == 4 ? 2 * dh + i : i % 4;   // compile-time except at HPR 4
                 const int kexp = (int) ((bexp >> (4 * i)) & 0xFu) - 1;
                 const __half2 Bh = __half2half2(__ushort_as_half((unsigned short) ((kexp + 15) << 10)));
                 const uint32_t sel = bi | ((4 + bi) << 4);
@@ -494,9 +522,9 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
                 }
 #pragma unroll
                 for (int n = 0; n < 2; ++n) {
-                    s_mma(sn, Kn, 2 * (8 * src + i) + n);   // S of the next tile, overlapped with this fold
+                    s_mma(sn, Kn, 2 * (NDB * src + i) + n);   // S of the next tile, overlapped with this fold
                     const int nt = 2 * i + n;
-                    const int d  = dh * D_PER_WARP + 8 * nt + g;
+                    const int d  = cb + 8 * nt + g;
                     const uint2    bv    = *reinterpret_cast<const uint2 *>(vt + vt_offset(d, 4 * t));
                     const uint32_t bb[2] = {bv.x, bv.y};
                     mma_e4m3_e2m1(o[nt], a, bb);
@@ -531,11 +559,11 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
         if (gr >= n_rows) {
             continue;
         }
-        const int tok = gr / gqa, h = kvh * gqa + gr % gqa;
-        float * out = p.dst + (((size_t) seq * p.n_q + tok) * p.n_head + h) * D + dh * D_PER_WARP + 2 * t;
+        const int tok = gr / G, h = (kvh * HPR + part) * G + gr % G;
+        float * out = p.dst + (((size_t) seq * p.n_q + tok) * p.n_head + h) * DR + dh * DPW + 2 * t;
         const float il = r ? il1 : il0;
 #pragma unroll
-        for (int nt = 0; nt < D_PER_WARP / 8; ++nt) {
+        for (int nt = 0; nt < DPW / 8; ++nt) {
             const int   kexp = (int) ((bexp >> (4 * (nt / 2))) & 0xFu) - 1;
             const float f    = il * __int_as_float((127 - kexp) << 23);
             *reinterpret_cast<float2 *>(out + 8 * nt) = make_float2(o[nt][2 * r] * f, o[nt][2 * r + 1] * f);
@@ -553,6 +581,14 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
 // Launch the prepasses and the kernel. workspace: workspace_bytes(...) bytes of device memory (contents
 // need not be preserved). Fills the tensor maps, tile_state and v_scale_max of p.
 static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream) {
+    p.hpr = heads_per_row(p.head_dim);
+    if (p.hpr == 0 || !kv_view_supported(p.head_dim, p.K, p.nbk1, p.nbk2, p.nbk3, p.n_head_kv) ||
+        !kv_view_supported(p.head_dim, p.V, p.nbv1, p.nbv2, p.nbv3, p.n_head_kv)) {
+        return cudaErrorInvalidValue;
+    }
+    p.n_head_kv /= p.hpr;   // virtual rows of hpr adjacent heads
+    p.nbk2      *= p.hpr;
+    p.nbv2      *= p.hpr;
     const int gqa  = p.n_head / p.n_head_kv;
     const int nblk = n_row_blocks(p.n_q, gqa);
     const int n_t  = n_kv_tiles(p.n_kv);
@@ -585,7 +621,8 @@ static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream
         k_tile_states<<<grid, 256, 0, stream>>>(p.mask, p.mask_s1, p.mask_s3, p.n_q, p.n_kv, gqa, tile_state);
         p.tile_state = tile_state;
     }
-    void (*kern)(Params) = p.softcap != 0.0f ? k_prefill<true> : k_prefill<false>;
+    void (*kern)(Params) = p.softcap != 0.0f ? (p.hpr == 1 ? k_prefill<true, 1> : p.hpr == 2 ? k_prefill<true, 2> : k_prefill<true, 4>)
+                                             : (p.hpr == 1 ? k_prefill<false, 1> : p.hpr == 2 ? k_prefill<false, 2> : k_prefill<false, 4>);
     err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
     if (err != cudaSuccess) {
         return err;

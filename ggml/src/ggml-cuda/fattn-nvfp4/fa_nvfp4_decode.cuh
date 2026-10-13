@@ -44,6 +44,8 @@ struct Params {
     int   n_q, n_kv, n_head, n_head_kv, n_seq;
     float scale;
     float softcap;                 // 0 = off; else logits become softcap * tanh(scale * q.k / softcap) (Gemma 2)
+    int   head_dim;                // 256, 128 or 64 (0 = 256); see prefill::Params::head_dim
+    int   hpr;                     // set by launch(): heads per virtual row; n_head_kv and nbk2 / nbv2 are virtual
 };
 
 __host__ __device__ constexpr int n_row_groups(int n_q, int gqa) { return (n_q * gqa + HEADS - 1) / HEADS; }
@@ -54,7 +56,8 @@ __host__ __device__ constexpr int groups_per_cta(int ngrp) {
     return ngrp <= 5 ? 1 : ngrp <= 8 ? 2 : ngrp <= 16 ? 4 : ngrp <= 32 ? MAX_GROUPS : 1;
 }
 
-static inline size_t workspace_bytes(int n_q, int n_head, int n_head_kv, int n_seq, int n_splits) {
+static inline size_t workspace_bytes(int n_q, int n_head, int n_head_kv, int n_seq, int n_splits, int head_dim = D) {
+    n_head_kv /= heads_per_row(head_dim);
     const size_t parts = (size_t) n_seq * n_head_kv * n_row_groups(n_q, n_head / n_head_kv) * n_splits * HEADS;
     return parts * D * sizeof(float) + parts * sizeof(float2);
 }
@@ -108,12 +111,14 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
         for (int r = warp; r < ng * HEADS; r += NCONSUMERS) {
             const int gr = row0 + r;
             const float * qrow = nullptr;
+            int part = 0;
             if (gr < n_rows) {
                 const int tok = gr / gqa, h = kvh * gqa + gr % gqa;
+                part = (gr % gqa) / (gqa / p.hpr);
                 qrow = reinterpret_cast<const float *>(reinterpret_cast<const char *>(p.Q) + seq * p.nbq3 + h * p.nbq2 +
                                                        tok * p.nbq1);
             }
-            quantize_q_row(qrow, qst[0][r], qst[1][r], &sm.q_alpha[r]);
+            quantize_q_row(qrow, qst[0][r], qst[1][r], &sm.q_alpha[r], p.hpr, part);
         }
     }
     if (threadIdx.x == 0) {
@@ -425,7 +430,10 @@ __global__ void __launch_bounds__(D) k_decode_combine(const __grid_constant__ Pa
             }
         }
         const int tok = gr / gqa, head = kvh * gqa + gr % gqa;
-        p.dst[(((size_t) seq * p.n_q + tok) * p.n_head + head) * D + d] = lsum > 0.0f ? acc / lsum : 0.0f;
+        const int dr = D / p.hpr, part = (gr % gqa) / (gqa / p.hpr);   // keep this head's segment
+        if (d / dr == part) {
+            p.dst[(((size_t) seq * p.n_q + tok) * p.n_head + head) * dr + d % dr] = lsum > 0.0f ? acc / lsum : 0.0f;
+        }
     }
 }
 
@@ -433,7 +441,9 @@ __global__ void __launch_bounds__(D) k_decode_combine(const __grid_constant__ Pa
 
 // Split count for the device: at most one wave of CTAs (one per SM), and at least ~12 tiles per split (measured: fewer,
 // longer splits win at every cache length; extra splits only add per-CTA setup and merge work).
-static inline int choose_splits(int n_kv, int n_q, int n_head, int n_head_kv, int n_seq, int n_sms, int ng = 0) {
+static inline int choose_splits(int n_kv, int n_q, int n_head, int n_head_kv, int n_seq, int n_sms, int ng = 0,
+                                int head_dim = D) {
+    n_head_kv /= heads_per_row(head_dim);
     const int n_t   = (n_kv + TILE_N - 1) / TILE_N;
     const int ngrp  = n_row_groups(n_q, n_head / n_head_kv);
     ng = ng > 0 ? ng : groups_per_cta(ngrp);
@@ -447,6 +457,14 @@ static inline int choose_splits(int n_kv, int n_q, int n_head, int n_head_kv, in
 // Launch the decode kernel and the split combine. workspace: workspace_bytes(...) bytes for p.n_splits (set it with
 // choose_splits).
 static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream) {
+    p.hpr = heads_per_row(p.head_dim);
+    if (p.hpr == 0 || !kv_view_supported(p.head_dim, p.K, p.nbk1, p.nbk2, p.nbk3, p.n_head_kv) ||
+        !kv_view_supported(p.head_dim, p.V, p.nbv1, p.nbv2, p.nbv3, p.n_head_kv)) {
+        return cudaErrorInvalidValue;
+    }
+    p.n_head_kv /= p.hpr;   // virtual rows of hpr adjacent heads
+    p.nbk2      *= p.hpr;
+    p.nbv2      *= p.hpr;
     const int gqa  = p.n_head / p.n_head_kv;
     const int ngrp = n_row_groups(p.n_q, gqa);
     const int n_t  = (p.n_kv + TILE_N - 1) / TILE_N;
