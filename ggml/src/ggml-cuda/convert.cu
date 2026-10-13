@@ -405,9 +405,8 @@ static __global__ void dequantize_block_nvfp4(
     const int64_t y0 = base + sub * QK_NVFP4_SUB + j;
     const int64_t y1 = y0 + QK_NVFP4_SUB / 2;
 
-    // kvalues_mxfp4 (== kvalues_fp4) stores 2x E2M1 values; multiply by 0.5f to compensate
-    yy[y0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F] * 0.5f);
-    yy[y1] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q >> 4] * 0.5f);
+    yy[y0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
+    yy[y1] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
 }
 
 template <typename dst_t>
@@ -694,6 +693,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F8_E4M3:
             return convert_unary_cuda<ggml_fp8_e4m3_t>;
+        case GGML_TYPE_NVFP4:
+            return dequantize_block_cuda<QK_NVFP4, 2, dequantize_nvfp4>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -721,6 +722,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F8_E4M3:
             return convert_unary_cuda<ggml_fp8_e4m3_t>;
+        case GGML_TYPE_NVFP4:
+            return dequantize_block_cuda<QK_NVFP4, 2, dequantize_nvfp4>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
         default:
@@ -748,6 +751,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F8_E4M3:
             return convert_unary_cuda<ggml_fp8_e4m3_t>;
+        case GGML_TYPE_NVFP4:
+            return dequantize_block_cuda<QK_NVFP4, 2, dequantize_nvfp4>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         default:

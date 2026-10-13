@@ -669,39 +669,75 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// NVFP4 V: split-half packing, byte j of a sub-block holds element j (low nibble) and element j+8 (high nibble).
+// kvalues_mxfp4 is doubled and ggml_cuda_ue4m3_to_fp32 returns the half scale.
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 2 || ne == 4, "bad ne");
     const block_nvfp4 * x = (const block_nvfp4 *) vx;
 
     const int64_t ib  = i0 / QK_NVFP4;
-    const int     iqs = i0 % QK_NVFP4;
+    const int     e   = i0 % QK_NVFP4;
+    const int     s   = e / QK_NVFP4_SUB;
+    const int     p0  = e % QK_NVFP4_SUB;
 
-    const int sub = iqs / QK_NVFP4_SUB;      // sub-block index (0..3)
-    const int pos = iqs % QK_NVFP4_SUB;      // position within sub-block (0..15)
-    const int byte_idx = (sub * QK_NVFP4_SUB + pos) / 2;  // byte index in qs array
-    const int nibble = pos % 2;              // 0 = low nibble, 1 = high nibble
+    int q = 0;
+    ggml_cuda_memcpy_1<ne>(&q, x[ib].qs + s*(QK_NVFP4_SUB/2) + p0 % (QK_NVFP4_SUB/2));
+    q = (q >> (4 * (p0 / (QK_NVFP4_SUB/2)))) & 0x0F0F0F0F;
+    const int     v  = get_int_from_table_16(q, kvalues_mxfp4).x;
+    const int8_t * q8 = (const int8_t *) &v;
+    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].d[s]);
 
-    // Scale for this sub-block (UE4M3)
-    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].d[sub]);
-
-    // Packed nibble
-    const uint8_t q_packed = x[ib].qs[byte_idx];
-    const int q = nibble == 0 ? (q_packed & 0xF) : (q_packed >> 4);
-
-    // E2M1 value (1 sign, 2 exp, 1 mantissa)
-    static constexpr float e2m1_lut[16] = {
-        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    const float val = e2m1_lut[q] * d;
-
-    if constexpr (std::is_same<T, half>::value) {
-        *((half *) dst) = __float2half_rn(val);
-    } else if constexpr (std::is_same<T, float>::value) {
-        *((float *) dst) = val;
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d2 = __float2half2_rn(d);
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d2 * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
+}
+
+// NVFP4 K: Q int k holds elements 4k..4k+3, which sit in 4 consecutive bytes of one sub-block, all in the low
+// (first half of the sub-block) or all in the high nibbles (second half).
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_nvfp4 * K_nvfp4 = (const block_nvfp4 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib = k_KQ / (QK_NVFP4/4);
+        const int e  = 4 * (k_KQ % (QK_NVFP4/4));
+        const int s  = e / QK_NVFP4_SUB;
+        const int p0 = e % QK_NVFP4_SUB;
+
+        int q;
+        ggml_cuda_memcpy_1<sizeof(int), 4>(&q, K_nvfp4[ib].qs + s*(QK_NVFP4_SUB/2) + p0 % (QK_NVFP4_SUB/2));
+        const int2 v    = get_int_from_table_16(q, kvalues_mxfp4);
+        const int  vals = p0 < QK_NVFP4_SUB/2 ? v.x : v.y;
+
+        const int    sumi = ggml_cuda_dp4a(vals, Q_q8[k_KQ_0/nthreads], 0);
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += ggml_cuda_ue4m3_to_fp32(K_nvfp4[ib].d[s]) * (sumi*Q_ds.x);
+    }
+
+    return sum;
 }
 
 template <ggml_type type_K, int D, int nthreads>
@@ -722,6 +758,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
         return vec_dot_fattn_vec_KQ_f8_e4m3<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_NVFP4) {
+        return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;

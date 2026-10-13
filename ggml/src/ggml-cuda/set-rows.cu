@@ -435,7 +435,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_NVFP4) {
-        set_rows_cuda_quant<idx_t, block_nvfp4, QK_NVFP4, quantize_f32_nvfp4_block_wrapper>(
+        set_rows_cuda_quant<idx_t, block_nvfp4, QK_NVFP4, quantize_f32_nvfp4_block>(
             src0_d, src1_d, (block_nvfp4*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
