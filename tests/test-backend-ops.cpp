@@ -9002,7 +9002,8 @@ struct test_flash_attn_ext : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        // the native NVFP4 kernel rounds P*V scale to E4M3 (3 mantissa bits): NMSE ~6e-4 by design
+        return type_K == GGML_TYPE_NVFP4 ? 1e-3 : 5e-4;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
