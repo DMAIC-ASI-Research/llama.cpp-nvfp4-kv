@@ -117,14 +117,14 @@ static_assert(Q_TERMS * BLOCK_M * ROW_BYTES <= (int) sizeof(((Smem *) nullptr)->
 // Decode kernel tile configuration (Phase 3): swapped orientation, S^T = K Q^T, O^T = V^T P'^T
 // ------------------------------------------------------------------------------------------------
 namespace decode {
-constexpr int NCONSUMERS      = 4;             // consumer warps, each owns whole TILE_N-token steps
+constexpr int NCONSUMERS      = 8;             // consumer warps, each owns whole TILE_N-token steps
 constexpr int NWARPS          = NCONSUMERS + 1;   // + 1 TMA producer warp
 constexpr int NTHREADS        = NWARPS * 32;   // 160
 constexpr int TILE_N          = 32;            // KV tokens per stage (two m16 tiles of S^T)
-constexpr int STAGES          = 4;
+constexpr int STAGES          = 8;             // two stages in flight per consumer warp
 constexpr int HEADS           = 8;             // MMA N: query heads per KV head, padded to 8
 constexpr int Q_TERMS         = 2;
-constexpr int MIN_CTAS_PER_SM = 2;
+constexpr int MIN_CTAS_PER_SM = 1;             // one CTA per SM: measured faster than two, and no 168-register cap
 
 struct alignas(128) Smem {
     uint8_t kv[STAGES][2][TILE_N][ROW_BYTES];      // raw ggml rows
@@ -134,7 +134,7 @@ struct alignas(128) Smem {
     uint64_t full[STAGES];
     uint64_t empty[STAGES];
 };
-static_assert(sizeof(Smem) + 1024 <= (100 * 1024) / MIN_CTAS_PER_SM, "decode smem exceeds the 2-CTA budget");
+static_assert(sizeof(Smem) + 1024 <= (100 * 1024) / MIN_CTAS_PER_SM, "decode smem exceeds the per-SM budget");
 static_assert((TILE_N * ROW_BYTES) % 128 == 0, "each TMA destination must stay 128-byte aligned");
 // Final cross-warp combine reuses kv[]: NCONSUMERS x (D x HEADS fp32 O^T + 2 x HEADS stats)
 static_assert(NCONSUMERS * (D * HEADS + 2 * HEADS) * 4 <= (int) sizeof(((Smem *) nullptr)->kv), "combine alias");

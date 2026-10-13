@@ -385,13 +385,13 @@ __global__ void __launch_bounds__(D) k_decode_combine(const __grid_constant__ Pa
 
 #endif // __CUDACC__
 
-// Split count for the device: about 2 CTAs per SM in total, at least 4 tiles per split.
+// Split count for the device: at most one wave of CTAs (one per SM), and at least ~12 tiles per split (measured: fewer,
+// longer splits win at every cache length; extra splits only add per-CTA setup and merge work).
 static inline int choose_splits(int n_kv, int n_q, int n_head, int n_head_kv, int n_seq, int n_sms) {
     const int n_t   = (n_kv + TILE_N - 1) / TILE_N;
     const int other = n_head_kv * n_row_groups(n_q, n_head / n_head_kv) * n_seq;
-    int s = (MIN_CTAS_PER_SM * n_sms + other - 1) / other;
-    s = s < 1 ? 1 : s;
-    s = s > (n_t + 3) / 4 ? (n_t + 3) / 4 : s;
+    int s = MIN_CTAS_PER_SM * n_sms / other;   // round down: one extra CTA would start a second wave
+    s = s > n_t / 12 ? n_t / 12 : s;
     return s < 1 ? 1 : s;
 }
 

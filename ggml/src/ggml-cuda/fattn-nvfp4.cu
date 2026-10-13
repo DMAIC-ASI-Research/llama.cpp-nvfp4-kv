@@ -4,8 +4,9 @@
 
 #include <cstdlib>
 
-// Up to this many (query token, head) rows per KV head the split-KV decode kernel is faster than prefill.
-static constexpr int NVFP4_DECODE_MAX_ROWS = 256;
+// Up to this many (query token, head) rows per KV head the split-KV decode kernel is faster than prefill
+// (crossover_bench: decode wins at 384 rows, prefill at 516, for 4k-106k caches).
+static constexpr int NVFP4_DECODE_MAX_ROWS = 448;
 
 static bool nvfp4_aligned16(const ggml_tensor * t) {
     return (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
