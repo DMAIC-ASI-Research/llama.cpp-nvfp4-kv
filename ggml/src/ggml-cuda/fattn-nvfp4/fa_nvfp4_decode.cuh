@@ -43,6 +43,7 @@ struct Params {
     int groups_per_cta;            // row groups served by one CTA (1, 2, 4 or 8), set by launch()
     int   n_q, n_kv, n_head, n_head_kv, n_seq;
     float scale;
+    float softcap;                 // 0 = off; else logits become softcap * tanh(scale * q.k / softcap) (Gemma 2)
 };
 
 __host__ __device__ constexpr int n_row_groups(int n_q, int gqa) { return (n_q * gqa + HEADS - 1) / HEADS; }
@@ -167,7 +168,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
         const int r = lgrp * HEADS + 2 * t + c;   // row of this CTA
-        rs[c] = sm.q_alpha[r] * p.scale * LOG2E;
+        rs[c] = sm.q_alpha[r] * p.scale * (p.softcap != 0.0f ? 1.0f / p.softcap : LOG2E);
         if (p.mask) {
             mrow[c] = p.mask + seq * p.mask_s3 + (size_t) (min(row0 + r, n_rows - 1) / gqa) * p.mask_s1;
         }
@@ -234,7 +235,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_decode(const __gr
 #pragma unroll
                 for (int c = 0; c < 2; ++c) {
                     float & v = s[mt][2 * r + c];
-                    v = v * rs[c] + mk[mt][r][c];
+                    v = (p.softcap != 0.0f ? p.softcap * LOG2E * fast_tanh(v * rs[c]) : v * rs[c]) + mk[mt][r][c];
                     mt_h[c] = fmaxf(mt_h[c], v);
                 }
             }

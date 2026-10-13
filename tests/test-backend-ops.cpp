@@ -12970,7 +12970,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     // NVFP4 KV cache, Qwen3.5-style D=256 GQA 6: vector kernel (decode) and f16 conversion (prefill)
     for (int nb : {1, 2, 75}) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+        for (float softcap : {0.0f, 50.0f}) {   // softcap: Gemma 2
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 0, softcap, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));

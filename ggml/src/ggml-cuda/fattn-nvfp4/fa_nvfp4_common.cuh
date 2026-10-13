@@ -57,6 +57,11 @@ static __device__ __forceinline__ void tma_load_4d(void * dst, const CUtensorMap
 static __device__ __forceinline__ void named_bar_sync(int id, int nthreads) {
     asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(nthreads) : "memory");
 }
+static __device__ __forceinline__ float fast_tanh(float x) {   // ~2^-11 relative error, far below E4M3 P'
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
 static __device__ __forceinline__ float fast_exp2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));

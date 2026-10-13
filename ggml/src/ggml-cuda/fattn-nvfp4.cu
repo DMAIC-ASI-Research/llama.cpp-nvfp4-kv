@@ -31,7 +31,7 @@ bool ggml_cuda_flash_attn_ext_nvfp4_usable(const int device, const ggml_tensor *
     if (K->type != GGML_TYPE_NVFP4 || V->type != GGML_TYPE_NVFP4 || Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
-    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || sinks || max_bias != 0.0f || logit_softcap != 0.0f) {
+    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 || sinks || max_bias != 0.0f) {
         return false;
     }
     if (ggml_get_op_params_i32(dst, 4) != 0) { // sparse n_kv_max hint
@@ -57,8 +57,9 @@ void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    float scale = 1.0f;
-    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    float scale = 1.0f, logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int n_q = Q->ne[1], n_head = Q->ne[2], n_seq = Q->ne[3];
     const int n_kv = K->ne[1], n_head_kv = K->ne[2];
@@ -76,6 +77,7 @@ void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor
         p.dst = (float *) dst->data;
         p.n_q = n_q; p.n_kv = n_kv; p.n_head = n_head; p.n_head_kv = n_head_kv; p.n_seq = n_seq;
         p.scale = scale;
+        p.softcap = logit_softcap;
         p.n_splits = fa_nvfp4::decode::choose_splits(n_kv, n_q, n_head, n_head_kv, n_seq, ggml_cuda_info().devices[ctx.device].nsm);
         ggml_cuda_pool_alloc<char> ws(ctx.pool(), fa_nvfp4::decode::workspace_bytes(n_q, n_head, n_head_kv, n_seq, p.n_splits));
         CUDA_CHECK(fa_nvfp4::decode::launch(p, ws.get(), stream));
@@ -88,6 +90,7 @@ void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor
         p.dst = (float *) dst->data;
         p.n_q = n_q; p.n_kv = n_kv; p.n_head = n_head; p.n_head_kv = n_head_kv; p.n_seq = n_seq;
         p.scale = scale;
+        p.softcap = logit_softcap;
         ggml_cuda_pool_alloc<char> ws(ctx.pool(), fa_nvfp4::prefill::workspace_bytes(n_q, n_kv, n_head, n_head_kv, n_seq));
         CUDA_CHECK(fa_nvfp4::prefill::launch(p, ws.get(), stream));
     }

@@ -59,6 +59,7 @@ struct Params {
     const int      * v_scale_max;
     int   n_q, n_kv, n_head, n_head_kv, n_seq;
     float scale;
+    float softcap;                 // 0 = off; else logits become softcap * tanh(scale * q.k / softcap) (Gemma 2)
 };
 
 // tile states: fully masked (not visited), unmasked (mask all zero, not loaded), mixed (mask applied per element)
@@ -130,6 +131,7 @@ constexpr float FLOOR_LOG2 = 32.0f;   // tile base never drops more than 2^32 be
 constexpr int   BAR_Q_FREE = 3;
 constexpr int   BAR_PAIR0  = 4;
 
+template <bool CAP>   // logit softcap compiled in or out, so the common no-cap kernel is unchanged
 __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __grid_constant__ Params p) {
 #ifdef FA_NVFP4_AVAILABLE
     extern __shared__ __align__(128) uint8_t smem_raw[];
@@ -218,8 +220,12 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             qsf[term][b]   = ld_s32(&qst[term][16 * rg + sfa_row(lane)][sf_word(b)]);
         }
     }
-    const float rs0 = q_alpha[lr0] * p.scale * LOG2E;   // S row factor, log2 domain
-    const float rs1 = q_alpha[lr1] * p.scale * LOG2E;
+    // S row factor (log2 domain); with a softcap the factor feeds tanh and softcap * LOG2E scales its output
+    constexpr bool has_cap = CAP;
+    const float cap_l2  = p.softcap * LOG2E;
+    const float rs0 = q_alpha[lr0] * p.scale * (has_cap ? 1.0f / p.softcap : LOG2E);
+    const float rs1 = q_alpha[lr1] * p.scale * (has_cap ? 1.0f / p.softcap : LOG2E);
+
     const int   gr0 = row0 + lr0, gr1 = row0 + lr1;
     const half * mrow0 = nullptr, * mrow1 = nullptr;
     if (p.mask) {
@@ -324,14 +330,26 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             sn[jj][0] = sn[jj][1] = sn[jj][2] = sn[jj][3] = 0.0f;
         }
 
-        // ---- scale, mask (only on mixed tiles), half-tile row max
+        // ---- scale, mask (only on mixed tiles), half-tile row max. With a softcap, tanh is applied in its own
+        //      uniform branch so the no-cap path stays the plain multiply.
+        float r0 = rs0, r1 = rs1;
+        if constexpr (has_cap) {
+#pragma unroll
+            for (int jj = 0; jj < NJ; ++jj) {
+                s[jj][0] = cap_l2 * fast_tanh(s[jj][0] * rs0);
+                s[jj][1] = cap_l2 * fast_tanh(s[jj][1] * rs0);
+                s[jj][2] = cap_l2 * fast_tanh(s[jj][2] * rs1);
+                s[jj][3] = cap_l2 * fast_tanh(s[jj][3] * rs1);
+            }
+            r0 = r1 = 1.0f;
+        }
         if (!mixed) {
 #pragma unroll
             for (int jj = 0; jj < NJ; ++jj) {
-                s[jj][0] *= rs0;
-                s[jj][1] *= rs0;
-                s[jj][2] *= rs1;
-                s[jj][3] *= rs1;
+                s[jj][0] *= r0;
+                s[jj][1] *= r0;
+                s[jj][2] *= r1;
+                s[jj][3] *= r1;
             }
         } else {
 #pragma unroll
@@ -350,10 +368,10 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
                         mk1.x = mrow1 ? __half2float(mrow1[col]) : 0.0f;
                     }
                 }
-                s[jj][0] = s[jj][0] * rs0 + mk0.x * LOG2E;
-                s[jj][1] = s[jj][1] * rs0 + mk0.y * LOG2E;
-                s[jj][2] = s[jj][2] * rs1 + mk1.x * LOG2E;
-                s[jj][3] = s[jj][3] * rs1 + mk1.y * LOG2E;
+                s[jj][0] = s[jj][0] * r0 + mk0.x * LOG2E;
+                s[jj][1] = s[jj][1] * r0 + mk0.y * LOG2E;
+                s[jj][2] = s[jj][2] * r1 + mk1.x * LOG2E;
+                s[jj][3] = s[jj][3] * r1 + mk1.y * LOG2E;
             }
         }
         float mt0 = -INFINITY, mt1 = -INFINITY;
@@ -567,11 +585,12 @@ static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream
         k_tile_states<<<grid, 256, 0, stream>>>(p.mask, p.mask_s1, p.mask_s3, p.n_q, p.n_kv, gqa, tile_state);
         p.tile_state = tile_state;
     }
-    err = cudaFuncSetAttribute(k_prefill, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
+    void (*kern)(Params) = p.softcap != 0.0f ? k_prefill<true> : k_prefill<false>;
+    err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
     if (err != cudaSuccess) {
         return err;
     }
-    k_prefill<<<dim3(nblk, p.n_head_kv, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p);
+    kern<<<dim3(nblk, p.n_head_kv, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p);
     return cudaGetLastError();
 }
 
