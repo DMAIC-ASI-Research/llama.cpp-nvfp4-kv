@@ -211,7 +211,8 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-// Device ports of ggml_fp32_to_ue4m3 and quantize_row_nvfp4_ref, bit-exact with the CPU reference.
+// Device ports of ggml_fp32_to_ue4m3 and quantize_row_nvfp4_ref (with its scale search), bit-exact with the CPU
+// reference.
 static __device__ __forceinline__ uint8_t nvfp4_fp32_to_ue4m3(float x) {
     if (!(x > 0.0f)) {
         return 0;
@@ -257,6 +258,55 @@ static __device__ __forceinline__ uint8_t nvfp4_best_index(const float x, const 
     return (uint8_t) best_index;
 }
 
+// Same as nvfp4_sub_sse / nvfp4_best_scale on the CPU (scale search "M3"): the UE4M3 codes bracketing amax/6,
+// amax/5 and amax/4, the smallest squared error wins; squares in double, added in the CPU's tree order. Used by
+// ggml_cpy; the KV-cache write is the parallel k_set_rows_nvfp4 in set-rows.cu, which gives the same bytes.
+static __device__ __forceinline__ double nvfp4_sub_sse(const float (&xs)[QK_NVFP4_SUB], const uint8_t ue) {
+    const float d = ggml_cuda_ue4m3_to_fp32(ue);
+    double sq[QK_NVFP4_SUB];
+#pragma unroll
+    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+        const float e = __fsub_rn(xs[j], __fmul_rn((float) kvalues_mxfp4[nvfp4_best_index(xs[j], d)], d));
+        sq[j] = __dmul_rn((double) e, (double) e);
+    }
+#pragma unroll
+    for (int o = QK_NVFP4_SUB/2; o > 0; o >>= 1) {
+#pragma unroll
+        for (int j = 0; j < o; ++j) {
+            sq[j] = __dadd_rn(sq[j], sq[j + o]);
+        }
+    }
+    return sq[0];
+}
+
+static __device__ __forceinline__ uint8_t nvfp4_best_scale(const float (&xs)[QK_NVFP4_SUB], const float amax) {
+    const float divs[3] = { 6.0f, 5.0f, 4.0f };
+    uint8_t best_ue  = 0;
+    double  best_sse = (double) INFINITY;
+#pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        const float   t  = __fdiv_rn(amax, divs[c]);
+        const uint8_t rn = nvfp4_fp32_to_ue4m3(t);
+        const float   v  = 2.0f*ggml_cuda_ue4m3_to_fp32(rn);
+        uint8_t lo = rn, hi = rn;
+        if (v > t) {
+            lo = rn > 0 ? rn - 1 : 0;
+        } else if (v < t) {
+            hi = rn < 0x7E ? rn + 1 : 0x7E;
+        }
+        const uint8_t cand[2] = { lo, hi };
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const double sse = nvfp4_sub_sse(xs, cand[k]);
+            if (sse < best_sse) {
+                best_sse = sse;
+                best_ue  = cand[k];
+            }
+        }
+    }
+    return best_ue;
+}
+
 template <typename src_t>
 static __device__ void quantize_nvfp4_block(const src_t * __restrict__ x, block_nvfp4 * __restrict__ y) {
 #pragma unroll
@@ -268,7 +318,7 @@ static __device__ void quantize_nvfp4_block(const src_t * __restrict__ x, block_
             xs[j] = ggml_cuda_cast<float>(x[s*QK_NVFP4_SUB + j]);
             amax  = fmaxf(amax, fabsf(xs[j]));
         }
-        const uint8_t ue = nvfp4_fp32_to_ue4m3(__fdiv_rn(amax, 6.0f));
+        const uint8_t ue = nvfp4_best_scale(xs, amax);
         y->d[s] = ue;
         const float d = ggml_cuda_ue4m3_to_fp32(ue);
 #pragma unroll

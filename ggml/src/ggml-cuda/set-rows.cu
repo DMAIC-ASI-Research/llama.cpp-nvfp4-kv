@@ -137,6 +137,117 @@ static __global__ void k_set_rows_quant(const half * __restrict__ src0,
     GGML_UNUSED(ne13);
 }
 
+// NVFP4 set_rows (the KV-cache write): one thread per value, 16 lanes per sub-block, so the scale search costs
+// about as much as the plain quantizer. amax and each candidate's squared error are butterfly reductions over
+// the 16 lanes (offsets 8, 4, 2, 1); every lane ends with the same sum, and quantize_row_nvfp4_ref and the serial
+// CUDA port in cpy-utils.cuh add in the same tree order, so all three store identical bytes.
+template <typename idx_t, typename src_t>
+static __global__ void k_set_rows_nvfp4(const src_t * __restrict__ src0, const idx_t * __restrict__ src1,
+                                        block_nvfp4 * __restrict__ dst, const int64_t ne_total,
+                                        const int64_t s01, const int64_t s02, const int64_t s03,
+                                        const int64_t s10, const int64_t s11, const int64_t s12,
+                                        const int64_t s1, const int64_t s2, const int64_t s3,
+                                        const uint3 ne00, const uint3 ne01, const uint3 ne02,
+                                        const uint3 ne11_fd, const uint3 ne12_fd) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i - (threadIdx.x & 31) >= ne_total) {   // ne_total is a multiple of 64: whole warps are in or out
+        return;
+    }
+
+    uint32_t tmp = (uint32_t) i;
+    uint2 dm = fast_div_modulo(tmp, ne00);
+    const int64_t i00 = dm.y;
+    tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne01);
+    const int64_t i01 = dm.y;
+    tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne02);
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    const float x = ggml_cuda_cast<float>(src0[i01*s01 + i02*s02 + i03*s03 + i00]);
+
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o, 16));
+    }
+
+    const float divs[3] = { 6.0f, 5.0f, 4.0f };
+    uint8_t best_ue  = 0;
+    double  best_sse = (double) INFINITY;
+#pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        const float   t  = __fdiv_rn(amax, divs[c]);
+        const uint8_t rn = nvfp4_fp32_to_ue4m3(t);
+        const float   v  = 2.0f*ggml_cuda_ue4m3_to_fp32(rn);
+        uint8_t lo = rn, hi = rn;
+        if (v > t) {
+            lo = rn > 0 ? rn - 1 : 0;
+        } else if (v < t) {
+            hi = rn < 0x7E ? rn + 1 : 0x7E;
+        }
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const uint8_t ue = k ? hi : lo;
+            const float   d  = ggml_cuda_ue4m3_to_fp32(ue);
+            const float   e  = __fsub_rn(x, __fmul_rn((float) kvalues_mxfp4[nvfp4_best_index(x, d)], d));
+            double sse = __dmul_rn((double) e, (double) e);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                sse = __dadd_rn(sse, __shfl_xor_sync(0xFFFFFFFFu, sse, o, 16));
+            }
+            if (sse < best_sse) {
+                best_sse = sse;
+                best_ue  = ue;
+            }
+        }
+    }
+
+    const int     j    = i00 % QK_NVFP4_SUB;
+    const int     sb   = (i00 % QK_NVFP4) / QK_NVFP4_SUB;
+    const uint8_t code = nvfp4_best_index(x, ggml_cuda_ue4m3_to_fp32(best_ue));
+    const uint8_t hi_c = __shfl_down_sync(0xFFFFFFFFu, code, QK_NVFP4_SUB/2, 16);
+    block_nvfp4 * blk = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_nvfp4) + i00 / QK_NVFP4;
+    if (j < QK_NVFP4_SUB/2) {
+        blk->qs[sb*(QK_NVFP4_SUB/2) + j] = code | (hi_c << 4);
+    }
+    if (j == 0) {
+        blk->d[sb] = best_ue;
+    }
+}
+
+template <typename idx_t, typename src_t>
+static void set_rows_cuda_nvfp4(
+        const src_t * src0_d, const idx_t * src1_d, block_nvfp4 * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_NVFP4 == 0);
+    GGML_UNUSED(ne10);
+    GGML_UNUSED(ne13);
+    const int64_t ne_total = ne00 * ne01 * ne02 * ne03;
+    if (ne_total == 0 || ne11 == 0 || ne12 == 0) {
+        return;
+    }
+    GGML_ASSERT(ne_total < (int64_t) UINT32_MAX);
+    const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
+    k_set_rows_nvfp4<idx_t, src_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne_total,
+        nb01/sizeof(src_t), nb02/sizeof(src_t), nb03/sizeof(src_t),
+        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t), nb1, nb2, nb3,
+        init_fastdiv_values((uint32_t) ne00), init_fastdiv_values((uint32_t) ne01),
+        init_fastdiv_values((uint32_t) ne02), init_fastdiv_values((uint32_t) ne11),
+        init_fastdiv_values((uint32_t) ne12));
+}
+
 // Template dispatch function for quantized set_rows
 template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
 static void set_rows_cuda_quant(
@@ -435,7 +546,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_NVFP4) {
-        set_rows_cuda_quant<idx_t, block_nvfp4, QK_NVFP4, quantize_f32_nvfp4_block>(
+        set_rows_cuda_nvfp4<idx_t, float>(
             src0_d, src1_d, (block_nvfp4*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -470,7 +581,7 @@ void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_te
             stream
         );
     } else if (dst->type == GGML_TYPE_NVFP4) {
-        set_rows_cuda_quant_half<int32_t, block_nvfp4, QK_NVFP4, quantize_f16_nvfp4_block>(
+        set_rows_cuda_nvfp4<int32_t, half>(
             src0_d, src1_d, (block_nvfp4*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -505,7 +616,7 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
             stream
         );
     } else if (dst->type == GGML_TYPE_NVFP4) {
-        set_rows_cuda_quant_half<int64_t, block_nvfp4, QK_NVFP4, quantize_f16_nvfp4_block>(
+        set_rows_cuda_nvfp4<int64_t, half>(
             src0_d, src1_d, (block_nvfp4*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
