@@ -385,6 +385,10 @@ if (APPLE)
     llama_build_and_test(test-host-buffer-release.cpp LINK ggml)
 endif()
 
+# NVFP4 KV state packer (internal to libllama, so its source is compiled in)
+add_executable(test-kv-compress test-kv-compress.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-compress.cpp)
+add_test(NAME test-kv-compress COMMAND $<TARGET_FILE:test-kv-compress>)
+
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp  LABEL "main behavior"  LINK ggml)

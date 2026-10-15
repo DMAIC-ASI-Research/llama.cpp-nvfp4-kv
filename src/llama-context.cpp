@@ -3286,6 +3286,10 @@ public:
         return size_written;
     }
 
+    bool size_only() const override {
+        return true;
+    }
+
 private:
     const bool skip_tensors;
 
@@ -3415,8 +3419,25 @@ public:
         buf_size -= size;
     }
 
+    const uint8_t * read_ptr(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        const uint8_t * p = ptr;
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+        return p;
+    }
+
+    void set_tensor(ggml_tensor * tensor, size_t offset, const uint8_t * data, size_t size, std::shared_ptr<void> keep) override {
+        rinfos.push_back({tensor, data, size, offset});
+        keeps.push_back(std::move(keep));
+    }
+
     void discard() override {
         rinfos.clear();
+        keeps.clear();
     }
 
     size_t n_bytes() override {
@@ -3436,6 +3457,7 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+    std::vector<std::shared_ptr<void>> keeps; // keeps set_tensor data alive until the flush
 };
 
 class llama_io_write_file : public llama_io_write_i {

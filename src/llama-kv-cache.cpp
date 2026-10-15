@@ -2,12 +2,14 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-kv-compress.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -2239,6 +2241,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
         return;
     }
+    // pack NVFP4 rows in host copies only (on-device state is not counted by the size pass)
+    const char * env_pack = getenv("LLAMA_KV_STATE_COMPRESS");
+    const bool pack = !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && (env_pack == nullptr || atoi(env_pack) != 0);
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2298,7 +2303,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         }
 
         state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
+        state_write_data(io, cr, pack);
     }
 }
 
@@ -2413,7 +2418,64 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
+// type id flag of a layer whose NVFP4 rows are stored packed (llama-kv-compress.h)
+static constexpr int32_t KV_TYPE_PACKED = 1 << 30;
+
+// all ranges of one layer as one packed unit: u64 size, then the packed data
+static void state_write_packed(llama_io_write_i & io, ggml_tensor * t, const std::vector<std::pair<uint32_t, uint32_t>> & ranges, size_t size_row) {
+    size_t n_rows = 0;
+    for (const auto & r : ranges) {
+        n_rows += r.second - r.first;
+    }
+    static thread_local std::vector<uint8_t> rows; // reused across layers and saves (avoids page faults)
+    rows.resize(n_rows * size_row);
+    size_t off = 0;
+    for (const auto & r : ranges) {
+        const size_t n = (r.second - r.first) * size_row;
+        ggml_backend_tensor_get(t, rows.data() + off, r.first * size_row, n);
+        off += n;
+    }
+    const size_t n_blocks = rows.size() / ggml_type_size(GGML_TYPE_NVFP4);
+    if (io.size_only()) {
+        // the size pass only needs the size, which the scale histogram gives
+        const uint64_t n_packed = llama_nvfp4_packed_size(rows.data(), n_blocks);
+        io.write(&n_packed, sizeof(n_packed));
+        io.write(rows.data(), n_packed); // data is ignored by the size pass
+        return;
+    }
+    static thread_local std::vector<uint8_t> packed;
+    packed.clear();
+    llama_nvfp4_pack(rows.data(), n_blocks, packed);
+    const uint64_t n_packed = packed.size();
+    io.write(&n_packed, sizeof(n_packed));
+    io.write(packed.data(), packed.size());
+}
+
+static bool state_read_packed(llama_io_read_i & io, ggml_tensor * t, uint32_t cell_count, const std::vector<std::pair<uint32_t, uint32_t>> & runs, size_t size_row) {
+    uint64_t n_packed;
+    io.read(&n_packed, sizeof(n_packed));
+    std::vector<uint8_t> copy;
+    const uint8_t * packed = io.read_ptr(n_packed);
+    if (!packed) {
+        copy.resize(n_packed);
+        io.read(copy.data(), copy.size());
+        packed = copy.data();
+    }
+    const size_t n_bytes = (size_t) cell_count * size_row;
+    std::shared_ptr<uint8_t[]> rows(new uint8_t[n_bytes]); // not zeroed: unpack writes every byte
+    if (!llama_nvfp4_unpack(packed, n_packed, rows.get(), n_bytes / ggml_type_size(GGML_TYPE_NVFP4))) {
+        return false;
+    }
+    size_t off = 0;
+    for (const auto & r : runs) {
+        const size_t n = (size_t) (r.second - r.first) * size_row;
+        io.set_tensor(t, (size_t) r.first * size_row, rows.get() + off, n, rows);
+        off += n;
+    }
+    return true;
+}
+
+void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, bool pack) const {
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
@@ -2434,12 +2496,18 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         auto * k = layer.k_stream[cr.strm];
 
         // Write key type
-        const int32_t k_type_i = (int32_t) k->type;
+        const bool k_pack = pack && k->type == GGML_TYPE_NVFP4;
+        const int32_t k_type_i = (int32_t) k->type | (k_pack ? KV_TYPE_PACKED : 0);
         io.write(&k_type_i, sizeof(k_type_i));
 
         // Write row size of key
         const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         io.write(&k_size_row, sizeof(k_size_row));
+
+        if (k_pack) {
+            state_write_packed(io, k, cr.data, k_size_row);
+            continue;
+        }
 
         // Read each range of cells of k_size length and write out
         for (const auto & range : cr.data) {
@@ -2461,12 +2529,18 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             }
 
             // Write value type
-            const int32_t v_type_i = (int32_t) v->type;
+            const bool v_pack = pack && v->type == GGML_TYPE_NVFP4;
+            const int32_t v_type_i = (int32_t) v->type | (v_pack ? KV_TYPE_PACKED : 0);
             io.write(&v_type_i, sizeof(v_type_i));
 
             // Write row size of value
             const uint64_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
             io.write(&v_size_row, sizeof(v_size_row));
+
+            if (v_pack) {
+                state_write_packed(io, v, cr.data, v_size_row);
+                continue;
+            }
 
             // Read each range of cells of v_size length and write out
             for (const auto & range : cr.data) {
@@ -2712,6 +2786,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             i0 = i1;
         }
     }
+    std::vector<std::pair<uint32_t, uint32_t>> run_pairs;
+    for (const auto & r : runs) {
+        run_pairs.emplace_back(r.from, r.to);
+    }
 
     uint32_t v_trans;
     uint32_t n_layer;
@@ -2759,8 +2837,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // Read type of key
         int32_t k_type_i_ref;
         io.read(&k_type_i_ref, sizeof(k_type_i_ref));
+        const bool k_packed = (k_type_i_ref & KV_TYPE_PACKED) != 0;
+        k_type_i_ref &= ~KV_TYPE_PACKED;
         const int32_t k_type_i = (int32_t) k->type;
-        if (k_type_i != k_type_i_ref) {
+        if (k_type_i != k_type_i_ref || (k_packed && k->type != GGML_TYPE_NVFP4)) {
             LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
             return false;
         }
@@ -2772,6 +2852,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         if (k_size_row != k_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
             return false;
+        }
+
+        if (k_packed) {
+            if (!state_read_packed(io, k, cell_count, run_pairs, k_size_row)) {
+                LLAMA_LOG_ERROR("%s: malformed packed keys (layer %d)\n", __func__, il);
+                return false;
+            }
+            continue;
         }
 
         for (const auto & r : runs) {
@@ -2793,8 +2881,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             // Read type of value
             int32_t v_type_i_ref;
             io.read(&v_type_i_ref, sizeof(v_type_i_ref));
+            const bool v_packed = (v_type_i_ref & KV_TYPE_PACKED) != 0;
+            v_type_i_ref &= ~KV_TYPE_PACKED;
             const int32_t v_type_i = (int32_t) v->type;
-            if (v_type_i != v_type_i_ref) {
+            if (v_type_i != v_type_i_ref || (v_packed && v->type != GGML_TYPE_NVFP4)) {
                 LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
                 return false;
             }
@@ -2806,6 +2896,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             if (v_size_row != v_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
                 return false;
+            }
+
+            if (v_packed) {
+                if (!state_read_packed(io, v, cell_count, run_pairs, v_size_row)) {
+                    LLAMA_LOG_ERROR("%s: malformed packed values (layer %d)\n", __func__, il);
+                    return false;
+                }
+                continue;
             }
 
             for (const auto & r : runs) {
