@@ -721,6 +721,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     }
     LOG("\n");
 
+    LOG_INF("DMAIC scored tokens: %d\n", count);   // with DMAIC_PPL_SCORE=assistant, the assistant tokens scored
     nll2 /= count;
     nll /= count;
     const double ppl = exp(nll);
@@ -1974,6 +1975,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     LOG("\n");
 
+    LOG_INF("DMAIC scored tokens: %zu\n", kld.count);
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
     const auto is_nan = [](float v) { return std::isnan(v); };
