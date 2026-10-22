@@ -13,7 +13,9 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -36,6 +38,64 @@ struct results_log_softmax {
     float  logit;
     float  prob;
 };
+
+// DMAIC 2026-10-22 (kvruler lesson 97): DMAIC_PPL_SCORE=assistant scores only the tokens the model generates in a
+// chat-rendered text: from after "<|im_start|>assistant\n" through "<|im_end|>". A chat-tuned model is not a language
+// model of tool or user turns (with the template in view it is confidently wrong there: PPL 1e5-1e6, also in BF16),
+// so those positions stay as context but are not scored. Unset: every position is scored, as upstream.
+static std::vector<uint8_t> g_score_mask;          // 1 = score the prediction of this token
+static const llama_token *  g_mask_tokens = nullptr;
+
+static void build_score_mask(llama_context * ctx, const std::vector<llama_token> & tokens) {
+    g_score_mask.clear();
+    g_mask_tokens = nullptr;
+    const char * mode = getenv("DMAIC_PPL_SCORE");
+    if (mode == nullptr || std::string(mode) != "assistant") {
+        return;
+    }
+    const auto one = [&](const char * text) {
+        const auto t = common_tokenize(ctx, text, false, true);
+        return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
+    };
+    const llama_token im_start = one("<|im_start|>"), im_end = one("<|im_end|>"), assistant = one("assistant");
+    GGML_ASSERT(im_start != LLAMA_TOKEN_NULL && im_end != LLAMA_TOKEN_NULL && assistant != LLAMA_TOKEN_NULL);
+    g_score_mask.assign(tokens.size(), 0);
+    g_mask_tokens = tokens.data();
+    int state = 0;   // 0 outside, 1 after "<|im_start|>", 2 in the assistant header (until its newline), 3 in the turn
+    size_t n = 0;
+    for (size_t j = 0; j < tokens.size(); ++j) {
+        const llama_token t = tokens[j];
+        if (t == im_start) { state = 1; continue; }
+        if (state == 1) { state = t == assistant ? 2 : 0; continue; }
+        if (state == 2) {
+            if (common_token_to_piece(ctx, t).find('\n') != std::string::npos) { state = 3; }
+            continue;
+        }
+        if (state == 3) {
+            g_score_mask[j] = 1;
+            n++;
+            if (t == im_end) { state = 0; }
+        }
+    }
+    LOG_INF("%s: DMAIC_PPL_SCORE=assistant: %zu of %zu tokens are assistant tokens (only these are scored)\n",
+            __func__, n, tokens.size());
+}
+
+// tokens[i+1] is the target of row i; `tokens` points into the vector the mask was built for
+static inline bool scored(const int * tokens, int i) {
+    return g_score_mask.empty() || g_score_mask[size_t(tokens - g_mask_tokens) + i + 1] != 0;
+}
+
+static int count_scored(const int * tokens, int n) {
+    if (g_score_mask.empty()) {
+        return n;
+    }
+    int c = 0;
+    for (int i = 0; i < n; ++i) {
+        c += scored(tokens, i);
+    }
+    return c;
+}
 
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
@@ -125,8 +185,10 @@ static void process_logits(
             lock.unlock();
             const results_log_softmax results = log_softmax(n_vocab, logits + size_t(i)*n_vocab, tokens[i+1]);
             const double v = -results.log_softmax;
-            local_nll += v;
-            local_nll2 += v*v;
+            if (scored(tokens, i)) {
+                local_nll += v;
+                local_nll2 += v*v;
+            }
 
             logit_history[i] = results.logit;
             prob_history[i]  = results.prob;
@@ -158,8 +220,10 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
             }
             lock.unlock();
             const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + size_t(i)*nv, tokens[i+1]);
-            local_nll += v;
-            local_nll2 += v*v;
+            if (scored(tokens, i)) {
+                local_nll += v;
+                local_nll2 += v*v;
+            }
         }
     };
     for (auto & w : workers) {
@@ -279,6 +343,11 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
+            if (!scored(tokens, i)) {
+                kld_values[i]    = std::numeric_limits<float>::quiet_NaN();
+                p_diff_values[i] = std::numeric_limits<float>::quiet_NaN();
+                continue;
+            }
             std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs + size_t(i)*nv, tokens[i+1], local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
@@ -471,6 +540,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
+    build_score_mask(ctx, tokens);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -632,7 +702,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                         logit_history.data() + start + seq*n_ctx + first,
                         prob_history.data()  + start + seq*n_ctx + first);
             }
-            count += n_ctx - first - 1;
+            count += count_scored(tokens.data() + start + seq*n_ctx + first, n_ctx - first - 1);
 
             // perplexity is e^(average negative log-likelihood)
             if (params.ppl_output_type == 0) {
@@ -1731,6 +1801,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         LOG_ERR("%s: failed reading evaluation tokens from %s\n", __func__, params.logits_file.c_str());
         return;
     }
+    build_score_mask(ctx, tokens);
 
     const int n_batch = params.n_batch;
     const int num_batches = (static_cast<int>(n_ctx) + n_batch - 1) / n_batch;
@@ -1905,6 +1976,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
+    const auto is_nan = [](float v) { return std::isnan(v); };
+    kld_values.erase(std::remove_if(kld_values.begin(), kld_values.end(), is_nan), kld_values.end());
+    p_diff_values.erase(std::remove_if(p_diff_values.begin(), p_diff_values.end(), is_nan), p_diff_values.end());
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
 
