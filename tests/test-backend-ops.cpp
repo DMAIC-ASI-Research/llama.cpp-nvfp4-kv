@@ -13349,6 +13349,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
+    // DMAIC 2026-10-22: Qwen3.8 long-context checks (PPL breaks past ~16k): IMROPE at positions up to 32k/262k,
+    // head 256 with 64 rotated dims; and one long gated-delta-net run
+    for (int ctx : {16384, 32768, 262144}) {
+        test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256, 24, 512, 1}, 64, GGML_ROPE_TYPE_IMROPE, ctx));
+        test_cases.emplace_back(new test_rope(GGML_TYPE_F16, {256, 24, 512, 1}, 64, GGML_ROPE_TYPE_IMROPE, ctx));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
