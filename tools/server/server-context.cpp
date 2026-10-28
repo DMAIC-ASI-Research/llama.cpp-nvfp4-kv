@@ -43,6 +43,10 @@
 #include <windows.h>
 #endif
 
+#if defined(__GLIBC__)
+#include <malloc.h> // malloc_trim after the prompt cache is cleared
+#endif
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -3380,6 +3384,26 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_CACHE_CLEAR:
+                {
+                    auto res = std::make_unique<server_task_result_cache_clear>();
+                    res->id = task.id;
+                    // a busy slot may be a sub-agent whose lead was just saved to the cache: keep it
+                    for (const auto & slot : slots) {
+                        res->skipped = res->skipped || slot.is_processing();
+                    }
+                    if (prompt_cache && !res->skipped) {
+                        res->n_states = prompt_cache->states.size();
+                        res->n_bytes  = prompt_cache->size();
+                        prompt_cache->states.clear();
+                    }
+#if defined(__GLIBC__)
+                    malloc_trim(0);
+#endif
+                    SRV_INF("prompt cache clear: %zu states, %.3f MiB%s\n", res->n_states, res->n_bytes / (1024.0 * 1024.0),
+                            res->skipped ? " (skipped: a slot is busy)" : "");
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -5889,6 +5913,27 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->post_cache_clear = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_CACHE_CLEAR);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
         return res;
     };
 

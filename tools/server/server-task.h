@@ -32,6 +32,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_CACHE_CLEAR,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -655,6 +656,21 @@ struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
 
     virtual json to_json() override;
+};
+
+// DMAIC: dropping the host-RAM prompt cache (--cache-ram) on request; the slots keep their KV
+struct server_task_result_cache_clear : server_task_result {
+    size_t n_states = 0;
+    size_t n_bytes  = 0;
+    bool   skipped  = false;
+
+    virtual json to_json() override {
+        return json {
+            { "n_states", n_states },
+            { "n_bytes",  n_bytes  },
+            { "skipped",  skipped  },
+        };
+    }
 };
 
 struct server_task_result_control : server_task_result {

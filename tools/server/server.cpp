@@ -217,6 +217,7 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.post("/cache/clear",              ex_wrapper(routes.post_cache_clear));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
