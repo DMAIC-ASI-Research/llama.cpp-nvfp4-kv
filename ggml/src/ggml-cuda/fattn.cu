@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -824,16 +826,53 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// How often each attention path ran (DMAIC): the fallbacks are otherwise silent. The first use of a path logs its
+// shapes, including the native path, so a quiet log means the logging ran; totals print at exit.
+namespace {
+struct fattn_path_counts {
+    std::atomic<uint64_t> native{0}, misaligned{0}, not_usable{0};
+    ~fattn_path_counts() {
+        fprintf(stderr, "fattn paths: native %llu, misaligned %llu, not usable %llu\n",
+                (unsigned long long) native.load(), (unsigned long long) misaligned.load(),
+                (unsigned long long) not_usable.load());
+    }
+};
+}
+static fattn_path_counts fattn_paths;
+
+static void fattn_path_first(const char * path, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    GGML_LOG_WARN("fattn path %s first used: Q %s [%lld %lld %lld %lld] nb1 %zu, K %s [%lld %lld %lld %lld] nb1 %zu, "
+                  "V %s nb1 %zu, data mod 16: Q %zu K %zu V %zu\n", path,
+                  ggml_type_name(Q->type), (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2],
+                  (long long) Q->ne[3], Q->nb[1],
+                  ggml_type_name(K->type), (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2],
+                  (long long) K->ne[3], K->nb[1], ggml_type_name(V->type), V->nb[1],
+                  (size_t) ((uintptr_t) Q->data % 16), (size_t) ((uintptr_t) K->data % 16),
+                  (size_t) ((uintptr_t) V->data % 16));
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     if (ggml_cuda_flash_attn_ext_nvfp4_usable(ctx.device, dst)) {
         // the output was sized without f16 K/V copies; the vector kernel reads NVFP4 directly and needs none either
         if (ggml_cuda_flash_attn_ext_nvfp4_aligned(dst)) {
+            if (fattn_paths.native.fetch_add(1, std::memory_order_relaxed) == 0) {
+                fattn_path_first("native", dst);
+            }
             ggml_cuda_flash_attn_ext_nvfp4(ctx, dst);
         } else {
+            if (fattn_paths.misaligned.fetch_add(1, std::memory_order_relaxed) == 0) {
+                fattn_path_first("misaligned (vec fallback)", dst);
+            }
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
         }
         return;
+    }
+    if (fattn_paths.not_usable.fetch_add(1, std::memory_order_relaxed) == 0) {
+        fattn_path_first("not usable (generic fallback)", dst);
     }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
