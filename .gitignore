@@ -153,3 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Claude Code approvals can hold secrets (Apiiro 2026-11-05)
+.claude/settings.local.json
