@@ -64,6 +64,17 @@ struct Params {
     // adjacent KV heads into one virtual 144-byte row (kv_view_supported() must hold for K and V).
     int   head_dim;
     int   hpr;                     // set by launch(): heads per virtual row; n_head_kv and nbk2 / nbv2 are virtual
+    // Option (b): KV split. k = number of CTAs per row block, split over the 64-token KV tiles; each CTA (blk, s)
+    // streams tiles [s * ceil(n_kv_tiles / k), (s + 1) * ceil(n_kv_tiles / k)) and writes one partial per row to
+    // part_ws (split_workspace_bytes() bytes), which k_split_merge folds into dst. k = 1 (default) is exactly the
+    // old path: full-range kernel, no part_ws, no merge (see launch_kern).
+    int   k = 1;
+    void * part_ws = nullptr;
+    // k = 0 above means "choose for me": launch() calls choose_k() with n_sms (this device's SM count, from
+    // prop.multiProcessorCount) and head_dim. The caller must size the workspace for the SAME k --
+    // workspace_bytes(..., k) with the k it got from choose_k() -- because choose_k() is pure, both compute it
+    // identically. k > 0 is used as given (today's behaviour); n_sms is unused then.
+    int   n_sms = 0;
 };
 
 // tile states: fully masked (not visited), unmasked (mask all zero, not loaded), mixed (mask applied per element)
@@ -73,11 +84,91 @@ __host__ __device__ constexpr int n_row_blocks(int n_q, int gqa) { return (n_q *
 __host__ __device__ constexpr int n_kv_tiles(int n_kv) { return (n_kv + BLOCK_N - 1) / BLOCK_N; }
 
 // Device scratch for launch(), carved from one allocation of workspace_bytes().
-static inline size_t workspace_bytes(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq, int head_dim = D) {
+static inline size_t workspace_bytes(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq, int head_dim = D, int k = 1) {
     n_head_kv /= heads_per_row(head_dim);
     const size_t nblk = (size_t) n_row_blocks(n_q, n_head / n_head_kv) * n_seq;
     const size_t states = (nblk * n_kv_tiles(n_kv) + 15) / 16 * 16;
-    return states + (size_t) n_seq * n_head_kv * DBLKS * sizeof(int);
+    size_t total = states + (size_t) n_seq * n_head_kv * DBLKS * sizeof(int);
+    if (k > 1) {   // option (b) split partials: k x 64 rows x 1032 B per (row block, KV head, sequence)
+        total += (size_t) nblk * n_head_kv * k * BLOCK_M * 1032;
+    }
+    return total;
+}
+
+// Device scratch for the option (b) split partials only: one partial per row per split, 1024 B of fp32 O (the full
+// 256-column virtual row) + 8 B (base, l) = 1032 B. Needed by launch() only when k > 1.
+static inline size_t split_workspace_bytes(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq, int k, int head_dim = D) {
+    n_head_kv /= heads_per_row(head_dim);
+    return (size_t) n_row_blocks(n_q, n_head / n_head_kv) * n_seq * n_head_kv * k * BLOCK_M * 1032;
+}
+
+// Split partials of one launch must stay under this (the s1c harness gates on it).
+constexpr size_t SPLIT_BYTES_MAX = (size_t) 100 * 1024 * 1024;
+
+// Split count k for the main kernel, from wave arithmetic on the CTA count. Pure: no CUDA call, n_sms is a
+// parameter, so the caller (sizing the workspace) and launch() (k = 0) compute the same k twice.
+//
+// A wave is one CTA per SM (MIN_CTAS_PER_SM = 1: the kernel's smem leaves room for exactly one block per SM).
+// The kernel's time is set by waves x tiles-per-CTA: the CTAs of a wave run concurrently and a partly filled
+// wave still costs its full time (its SMs idle while the busy ones finish). Depth therefore enters twice: it
+// divides the n_t KV tiles per CTA (n_t = ceil(n_kv / BLOCK_N), 1664 at n_kv 106496) and it multiplies the
+// CTA count, which costs a per-CTA setup (see below). Work is counted in fifth-tiles:
+//     cost(k) = 5 * ceil(n_cta * k / n_sms) * ceil(n_t / k) + S * n_cta * k,  n_cta = n_row_blocks * n_head_kv * n_seq
+// and choose_k returns the plain argmin of cost over 1..kmax, ties to the smaller k: no threshold, no wave
+// heuristic, no special case. A shallow k wins only where it is genuinely the cheapest.
+//
+// S is one constant for every cell and every card: the per-CTA setup of a split, fitted at S = 1.0 fifth-tile
+// = 0.2 of a KV tile. It stands for Q staging into smem, the 1032 B partial each split writes per row
+// (split_workspace_bytes), and the merge's extra read of those partials. Fit: grid search over S against the
+// 30 S1c medians (5 n_q x 6 n_kv, k = 1..14, n_sms = 70), scoring agreement with the best measured k; first
+// S in [0, 3] step 0.05, then [0.45, 1.7] step 0.005. S = 0 gives 6/30, 0.3 -> 14/30, 0.5 -> 20/30,
+// 0.85..1.10 -> 24/30 (mean loss 0.06 %, max 1.21 % on the measured cells), 2.0 -> 19/30; S = 1.0 is the
+// middle of that plateau. The form stays card-independent (n_sms is an input), but the fit is to this card.
+//
+// What one constant cannot do: it does not match every cell. At n_q 32, n_kv 106496 the measurement prefers
+// k = 5, but k = 11 is cheaper in the model until S > 2.0; at n_q 64, n_kv 106496 the measurement prefers
+// k = 14, but the model needs S < 0.90 for that. Four cells therefore pick an unmeasured k. A per-wave or
+// per-n_q term would fix one and break the other, so none is added. tests/k_chooser_check.cu prints the full
+// table and each cell's difference; it makes no pass/fail judgement.
+//
+// k_override > 0 is returned as given (an explicit test override), except that it is clamped to the hard
+// bounds below; it is never raised, and never silently accepted beyond them.
+static inline int choose_k(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq, int n_sms,
+                           int k_override = 0, int head_dim = D) {
+    if (n_sms < 1) {
+        n_sms = 1;   // pure function: no caller value may divide by zero
+    }
+    n_head_kv /= heads_per_row(head_dim);
+    if (n_head_kv < 1 || n_head / n_head_kv < 1) {
+        return 1;
+    }
+    const int  n_cta = n_row_blocks(n_q, n_head / n_head_kv) * n_head_kv * n_seq;
+    const int  n_t   = n_kv_tiles(n_kv);
+    const long per_k = (long) n_cta * BLOCK_M * 1032;   // one partial per row per split (split_workspace_bytes)
+    int kmax = per_k > 0 ? (int) (SPLIT_BYTES_MAX / per_k) : n_t;   // <= 100 MiB of split partials
+    kmax = kmax < n_t ? kmax : n_t;                                 // and <= n_kv_tiles (no empty split)
+    kmax = kmax < 1 ? 1 : kmax;
+
+    if (k_override > 0) {
+        return k_override < kmax ? k_override : kmax;
+    }
+    const int cap = MIN_CTAS_PER_SM * n_sms;
+    constexpr long SETUP_5THS = 1;   // per-CTA setup S: 1.0 fifth-tile = 0.2 KV tile (fitted, see above)
+    const auto cost = [&](int k) -> long {   // fifth-tiles; BLOCK_N-sized tiles, same work per tile at any n_q
+        const long rounds = ((long) n_cta * k + cap - 1) / cap;
+        const long tpp    = (n_t + k - 1) / k;
+        return 5 * rounds * tpp + SETUP_5THS * (long) n_cta * k;
+    };
+    int  best_k = 1;
+    long best_c = cost(best_k);
+    for (int k = 2; k <= kmax; ++k) {   // plain argmin; a tie keeps the smaller k
+        const long c = cost(k);
+        if (c < best_c) {
+            best_k = k;
+            best_c = c;
+        }
+    }
+    return best_k;
 }
 
 #ifdef __CUDACC__
@@ -137,9 +228,14 @@ constexpr int   BAR_Q_FREE = 3;
 constexpr int   BAR_PAIR0  = 4;
 
 // CAP: logit softcap compiled in or out; HPR: heads per virtual row (1, 2, 4), compile-time so the D = 256 kernel
-// is unchanged by the head-size support
+// is unchanged by the head-size support.
+// Option (b) split: split_k > 1 splits the KV tiles over split_k CTAs per row block (grid.x = n_row_blocks *
+// split_k), CTA (blk, s) streaming [s * tpp, min(s * tpp + tpp, n_t)) with tpp = ceil(n_kv_tiles / k); the
+// defaults (split_k = 1, tpp = 0) keep blockIdx.x = blk and the full [0, n_kv_tiles) range, so an unmodified
+// call is exactly the pre-split kernel. With part_ws != null the final store writes one partial per row instead.
 template <bool CAP, int HPR>
-__global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __grid_constant__ Params p) {
+__global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __grid_constant__ Params p,
+                                                                       int split_k = 1, int tpp = 0) {
 #ifdef FA_NVFP4_AVAILABLE
     extern __shared__ __align__(128) uint8_t smem_raw[];
     Smem & sm = *reinterpret_cast<Smem *>(smem_raw);
@@ -148,9 +244,14 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     const int g = frag_g(lane), t = frag_t(lane);
     const int rg = warp / D_SPLIT;   // row group: rows 16*rg .. 16*rg+15
     const int dh = warp % D_SPLIT;   // O columns 128*dh .. 128*dh+127
-    const int blk = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    const int s   = split_k > 1 ? blockIdx.x % split_k : 0;
+    const int blk = split_k > 1 ? blockIdx.x / split_k : blockIdx.x;   // option (b): grid.x = n_row_blocks * split_k
+    const int kvh = blockIdx.y, seq = blockIdx.z;
     const int gqa    = p.n_head / p.n_head_kv;
     const int n_t    = n_kv_tiles(p.n_kv);
+    // Option (b) split: CTA (blk, s) streams only the tiles [t_lo, t_hi); split_k = 1 keeps the full [0, n_t).
+    const int t_lo   = split_k > 1 ? s * tpp : 0;
+    const int t_hi   = split_k > 1 ? min(s * tpp + tpp, n_t) : n_t;
     // Head sizes below 256 (HPR > 1): row group rg serves only head segment part = rg % HPR of the virtual row, so
     // its S skips the other segments' k64 blocks and its two warps split that segment's DR columns of O. Rows of a
     // segment are (token, head of the real GQA group) pairs, q = token * G + head; a block holds RPB of each segment.
@@ -163,7 +264,10 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     const int     n_rows = p.n_q * G;              // rows per segment
     const int     cb   = part * DR + dh * DPW;     // first virtual O column of this warp
     // The producer and the MMA warps walk the same tile sequence: every tile whose state is not TILE_SKIP.
-    const uint8_t * tstate = p.tile_state ? p.tile_state + ((size_t) seq * gridDim.x + blk) * n_t : nullptr;
+    // Option (b): the state buffer is per row block, not per CTA (grid.x is n_row_blocks * split_k; with
+    // split_k = 1 grid.x == nblk, so this is the old index).
+    const int nblk   = n_row_blocks(p.n_q, gqa);
+    const uint8_t * tstate = p.tile_state ? p.tile_state + ((size_t) seq * nblk + blk) * n_t : nullptr;
     auto tile_state = [&](const int T) -> int {
         if (tstate) {
             return __ldg(tstate + T);
@@ -207,7 +311,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // generic Q staging writes -> async proxy
             const bool tok_first = p.tm_tok_dim == 1;
             int i = 0;
-            for (int T = next_tile(0); T < n_t; T = next_tile(T + 1), ++i) {
+            for (int T = next_tile(t_lo); T < t_hi; T = next_tile(T + 1), ++i) {
                 const int st = i % STAGES;
                 if (i >= STAGES) {
                     mbar_wait(&sm.empty[st], ((i / STAGES) - 1) & 1);
@@ -329,8 +433,8 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
 
     // Software pipeline: S(t+1) and the V^T staging of tile t+1 run during the PV product of tile t.
     float sn[NJ][4];   // S of the next tile
-    int T = next_tile(0);
-    if (T < n_t) {
+    int T = next_tile(t_lo);
+    if (T < t_hi) {
         mbar_wait(&sm.full[0], 0);
         stage_vt(sm.kv[0][1][0], 0);
 #pragma unroll
@@ -342,7 +446,7 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
             s_mma(sn, sm.kv[0][0][0], idx);
         }
     }
-    for (int it = 0; T < n_t; ++it) {
+    for (int it = 0; T < t_hi; ++it) {
         const int  kv0    = T * BLOCK_N;
         const bool mixed  = tile_state(T) == TILE_MIXED;
         const int  T_next = next_tile(T + 1);
@@ -470,7 +574,8 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
         // next tile: wait for its data and stage its V^T (buffer (it+1)&1 was last read by PV(t-1), which every
         // warp of the group finished before the barrier above). Without a next tile the S MMAs below re-read the
         // current stage and their result is discarded, so the PV loop stays branch-free.
-        const bool has_next = T_next < n_t;
+        // Option (b): the producer streams only [t_lo, t_hi), so a split CTA must not wait on a stage it never loads.
+        const bool has_next = T_next < t_hi;
         const uint8_t * Kn = sm.kv[st][0][0];
         if (has_next) {
             const int st1 = (it + 1) % STAGES;
@@ -553,20 +658,52 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
     l0 += sm.pmx[rg][dh ^ 1][g];
     l1 += sm.pmx[rg][dh ^ 1][g + 8];
     const float il0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, il1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    if (p.part_ws) {
+        // ---- Option (b): one partial per CTA row instead of the dst store. 1032 B = O[256] f32 (virtual
+        //      columns, this row's cb = part*DR + dh*DPW slice) in units of exp2(base) * 2^-kexp, then f32
+        //      base, f32 l. The 1/l normalization is applied once, at the merge (lsum = sum f*l). An empty
+        //      split range (no tiles fetched) has a = -inf, l = 0, O = 0 and reads the neutral partial
+        //      base = -inf, l = 0, O = 0. Padding rows (gr >= n_rows) are neutral too.
+        const float base0 = a0, base1 = a1;
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-        const int gr = r ? gr1 : gr0;
-        if (gr >= n_rows) {
-            continue;
+        for (int r = 0; r < 2; ++r) {
+            const int gr = r ? gr1 : gr0;
+            float * pr = reinterpret_cast<float *>(p.part_ws) +
+                         (((((size_t) seq * nblk + blk) * p.n_head_kv + kvh) * split_k + s) * BLOCK_M + 16 * rg + g + 8 * r) * 258;   // 1032 B / sizeof(float)
+            if (gr >= n_rows) {
+                pr[256] = -INFINITY, pr[257] = 0.0f;   // base, l
+#pragma unroll
+                for (int nt = 0; nt < DPW / 8; ++nt) {
+                    *reinterpret_cast<float2 *>(pr + cb + 2 * t + 8 * nt) = make_float2(0.0f, 0.0f);
+                }
+                continue;
+            }
+            pr[256] = r ? base1 : base0;
+            pr[257] = r ? l1 : l0;
+#pragma unroll
+            for (int nt = 0; nt < DPW / 8; ++nt) {
+                const int   kexp = (int) ((bexp >> (4 * (nt / 2))) & 0xFu) - 1;
+                const float f    = __int_as_float((127 - kexp) << 23);
+                *reinterpret_cast<float2 *>(pr + cb + 2 * t + 8 * nt) = make_float2(o[nt][2 * r] * f, o[nt][2 * r + 1] * f);
+            }
         }
-        const int tok = gr / G, h = (kvh * HPR + part) * G + gr % G;
-        float * out = p.dst + (((size_t) seq * p.n_q + tok) * p.n_head + h) * DR + dh * DPW + 2 * t;
-        const float il = r ? il1 : il0;
+    } else {
+        // exactly the old dst store (the k = 1 path)
 #pragma unroll
-        for (int nt = 0; nt < DPW / 8; ++nt) {
-            const int   kexp = (int) ((bexp >> (4 * (nt / 2))) & 0xFu) - 1;
-            const float f    = il * __int_as_float((127 - kexp) << 23);
-            *reinterpret_cast<float2 *>(out + 8 * nt) = make_float2(o[nt][2 * r] * f, o[nt][2 * r + 1] * f);
+        for (int r = 0; r < 2; ++r) {
+            const int gr = r ? gr1 : gr0;
+            if (gr >= n_rows) {
+                continue;
+            }
+            const int tok = gr / G, h = (kvh * HPR + part) * G + gr % G;
+            float * out = p.dst + (((size_t) seq * p.n_q + tok) * p.n_head + h) * DR + dh * DPW + 2 * t;
+            const float il = r ? il1 : il0;
+#pragma unroll
+            for (int nt = 0; nt < DPW / 8; ++nt) {
+                const int   kexp = (int) ((bexp >> (4 * (nt / 2))) & 0xFu) - 1;
+                const float f    = il * __int_as_float((127 - kexp) << 23);
+                *reinterpret_cast<float2 *>(out + 8 * nt) = make_float2(o[nt][2 * r] * f, o[nt][2 * r + 1] * f);
+            }
         }
     }
 #else
@@ -576,11 +713,81 @@ __global__ void __launch_bounds__(NTHREADS, MIN_CTAS_PER_SM) k_prefill(const __g
 }
 
 // ------------------------------------------------------------------------------------------------
+// Option (b) merge: fold the split_k partials of every (seq, row block, KV head) into dst, modeled on
+// k_decode_combine (fa_nvfp4_decode.cuh). grid (n_row_blocks, n_head_kv, n_seq), block 256 with the
+// k_prefill MMA layout: thread (rg, dh, lane) handles CTA rows 16*rg + lane/4 (+8) and virtual columns
+// cb + 2*(lane%4) + 8*nt, exactly the rows and columns its k_prefill store wrote. A neutral partial
+// (base = -inf, l = 0) gets a zero factor, so an all-neutral row writes 0 like the old path's l = 0 rows.
+// ------------------------------------------------------------------------------------------------
+template <int HPR>
+__global__ void __launch_bounds__(256) k_split_merge(const __grid_constant__ Params p, const int split_k, const int nblk) {
+    constexpr int DR  = D / HPR;
+    constexpr int DPW = DR / D_SPLIT;
+    const int rg   = threadIdx.x / (D_SPLIT * 32);
+    const int dh   = (threadIdx.x / 32) % D_SPLIT;
+    const int lane = threadIdx.x % 32;
+    const int blk  = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    const int G    = p.n_head / p.n_head_kv / HPR;
+    const int n_rows = p.n_q * G;
+    const int part   = rg % HPR;
+    const int cb     = part * DR + dh * DPW;   // this row's O slice of the 256-column partial
+    const float * ws = reinterpret_cast<const float *>(p.part_ws);
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int q  = (rg / HPR) * 16 + lane / 4 + 8 * r;
+        const int gr = blk * (BLOCK_M / HPR) + q;
+        if (gr >= n_rows) {
+            continue;   // padding row: all its partials are neutral, dst keeps the old path's 0
+        }
+        const int R = 16 * rg + lane / 4 + 8 * r;   // CTA row of the partial
+        auto partial = [&](const int s) -> const float * {
+            return ws + (((((size_t) seq * nblk + blk) * p.n_head_kv + kvh) * split_k + s) * BLOCK_M + R) * 258;   // 1032 B / sizeof(float)
+        };
+        float amax = -INFINITY;
+        for (int s = 0; s < split_k; ++s) {
+            amax = fmaxf(amax, partial(s)[256]);
+        }
+        float acc[DPW / 8][2];
+#pragma unroll
+        for (int nt = 0; nt < DPW / 8; ++nt) {
+            acc[nt][0] = acc[nt][1] = 0.0f;
+        }
+        float lsum = 0.0f;
+        if (amax != -INFINITY) {
+            for (int s = 0; s < split_k; ++s) {
+                const float * pr   = partial(s);
+                const float base   = pr[256];
+                const float l      = pr[257];
+                const float f      = base == -INFINITY ? 0.0f : exp2f(base - amax);   // neutral: no contribution
+                if (f == 0.0f) {
+                    continue;
+                }
+                lsum += f * l;
+#pragma unroll
+                for (int nt = 0; nt < DPW / 8; ++nt) {
+                    const float2 v = *reinterpret_cast<const float2 *>(pr + cb + 2 * (lane % 4) + 8 * nt);
+                    acc[nt][0] += f * v.x;
+                    acc[nt][1] += f * v.y;
+                }
+            }
+        }
+        const int tok = gr / G, h = (kvh * HPR + part) * G + gr % G;
+        float * out = p.dst + (((size_t) seq * p.n_q + tok) * p.n_head + h) * DR + dh * DPW + 2 * (lane % 4);
+#pragma unroll
+        for (int nt = 0; nt < DPW / 8; ++nt) {
+            *reinterpret_cast<float2 *>(out + 8 * nt) = lsum > 0.0f ? make_float2(acc[nt][0] / lsum, acc[nt][1] / lsum)
+                                                                     : make_float2(0.0f, 0.0f);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
 // Host side
 // ------------------------------------------------------------------------------------------------
-// Launch the prepasses and the kernel. workspace: workspace_bytes(...) bytes of device memory (contents
-// need not be preserved). Fills the tensor maps, tile_state and v_scale_max of p.
-static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream) {
+// launch() split into prepare() and the three launch_* parts (same sequence, same order), so the
+// parts can be timed apart. workspace: workspace_bytes(...) bytes of device memory (contents need
+// not be preserved). prepare() fills the tensor maps, tile_state and v_scale_max of p.
+static inline cudaError_t prepare(Params & p, void * workspace, cudaStream_t stream) {
     p.hpr = heads_per_row(p.head_dim);
     if (p.hpr == 0 || !kv_view_supported(p.head_dim, p.K, p.nbk1, p.nbk2, p.nbk3, p.n_head_kv) ||
         !kv_view_supported(p.head_dim, p.V, p.nbv1, p.nbv2, p.nbv3, p.n_head_kv)) {
@@ -608,27 +815,76 @@ static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream
     if (err != cudaSuccess) {
         return err;
     }
-    err = cudaMemsetAsync(vmax, 0, (size_t) p.n_seq * p.n_head_kv * DBLKS * sizeof(int), stream);
+    p.v_scale_max = vmax;
+    p.tile_state  = p.mask ? tile_state : nullptr;
+    return cudaSuccess;
+}
+
+// Prepass 1: zero the per-d-block max accumulator and run k_v_scale_max over V.
+static inline cudaError_t launch_v_scale_max(Params p, cudaStream_t stream) {
+    cudaError_t err = cudaMemsetAsync(const_cast<int *>(p.v_scale_max), 0, (size_t) p.n_seq * p.n_head_kv * DBLKS * sizeof(int), stream);
     if (err != cudaSuccess) {
         return err;
     }
     const int vchunks = min(64, (p.n_kv + 255) / 256);
-    k_v_scale_max<<<dim3(vchunks, p.n_head_kv, p.n_seq), 256, 0, stream>>>(p.V, p.nbv1, p.nbv2, p.nbv3, p.n_kv, vmax);
-    p.v_scale_max = vmax;
-    p.tile_state  = nullptr;
-    if (p.mask) {
+    k_v_scale_max<<<dim3(vchunks, p.n_head_kv, p.n_seq), 256, 0, stream>>>(p.V, p.nbv1, p.nbv2, p.nbv3, p.n_kv, const_cast<int *>(p.v_scale_max));
+    return cudaGetLastError();
+}
+
+// Prepass 2: classify every (row block, KV tile) for the mask (no-op without a mask).
+static inline cudaError_t launch_tile_states(Params p, cudaStream_t stream) {
+    if (p.tile_state) {
+        const int gqa  = p.n_head / p.n_head_kv;
+        const int nblk = n_row_blocks(p.n_q, gqa);
+        const int n_t  = n_kv_tiles(p.n_kv);
         const dim3 grid((n_t + STATE_TILES_PER_CTA - 1) / STATE_TILES_PER_CTA, nblk, p.n_seq);
-        k_tile_states<<<grid, 256, 0, stream>>>(p.mask, p.mask_s1, p.mask_s3, p.n_q, p.n_kv, gqa, tile_state);
-        p.tile_state = tile_state;
+        k_tile_states<<<grid, 256, 0, stream>>>(p.mask, p.mask_s1, p.mask_s3, p.n_q, p.n_kv, gqa, const_cast<uint8_t *>(p.tile_state));
     }
-    void (*kern)(Params) = p.softcap != 0.0f ? (p.hpr == 1 ? k_prefill<true, 1> : p.hpr == 2 ? k_prefill<true, 2> : k_prefill<true, 4>)
+    return cudaGetLastError();
+}
+
+// The main kernel.
+static inline cudaError_t launch_kern(const Params & p, cudaStream_t stream) {
+    const int gqa  = p.n_head / p.n_head_kv;
+    const int nblk = n_row_blocks(p.n_q, gqa);
+    void (*kern)(Params, int, int) = p.softcap != 0.0f ? (p.hpr == 1 ? k_prefill<true, 1> : p.hpr == 2 ? k_prefill<true, 2> : k_prefill<true, 4>)
                                              : (p.hpr == 1 ? k_prefill<false, 1> : p.hpr == 2 ? k_prefill<false, 2> : k_prefill<false, 4>);
-    err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
+    cudaError_t err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));   // per device
     if (err != cudaSuccess) {
         return err;
     }
-    kern<<<dim3(nblk, p.n_head_kv, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p);
+    if (p.k == 1) {   // k = 1 is exactly the old path: same grid, same launch, no part_ws, no merge
+        kern<<<dim3(nblk, p.n_head_kv, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p, 1, 0);
+    } else {          // option (b): CTA (blk, s) streams tiles [s*tpp, min((s+1)*tpp, n_t)), then the merge folds them
+        const int tpp = (n_kv_tiles(p.n_kv) + p.k - 1) / p.k;
+        kern<<<dim3(nblk * p.k, p.n_head_kv, p.n_seq), NTHREADS, sizeof(Smem), stream>>>(p, p.k, tpp);
+        auto merge = p.hpr == 1 ? k_split_merge<1> : p.hpr == 2 ? k_split_merge<2> : k_split_merge<4>;
+        merge<<<dim3(nblk, p.n_head_kv, p.n_seq), 256, 0, stream>>>(p, p.k, nblk);
+    }
     return cudaGetLastError();
+}
+
+// Launch the prepasses and the kernel.
+static inline cudaError_t launch(Params p, void * workspace, cudaStream_t stream) {
+    if (p.k < 0 || (p.k == 0 && p.n_sms < 1)) {
+        return cudaErrorInvalidValue;   // k = 0 needs the caller's SM count; a negative k is not a split count
+    }
+    if (p.k == 0) {   // choose here; the caller sized the workspace with the same (pure) chooser
+        p.k = choose_k(p.n_q, p.n_kv, p.n_head, p.n_head_kv, p.n_seq, p.n_sms, 0, p.head_dim);
+    }
+    if (p.k > 1 && p.part_ws == nullptr) {
+        return cudaErrorInvalidValue;   // option (b): k > 1 needs the split partials (split_workspace_bytes)
+    }
+    if (cudaError_t err = prepare(p, workspace, stream); err != cudaSuccess) {
+        return err;
+    }
+    if (cudaError_t err = launch_v_scale_max(p, stream); err != cudaSuccess) {
+        return err;
+    }
+    if (cudaError_t err = launch_tile_states(p, stream); err != cudaSuccess) {
+        return err;
+    }
+    return launch_kern(p, stream);
 }
 
 #endif // __CUDACC__

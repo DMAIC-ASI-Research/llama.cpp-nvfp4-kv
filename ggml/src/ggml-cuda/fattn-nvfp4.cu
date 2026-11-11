@@ -107,7 +107,30 @@ void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor
         p.scale = scale;
         p.softcap = logit_softcap;
         p.head_dim = head_dim;
-        ggml_cuda_pool_alloc<char> ws(ctx.pool(), fa_nvfp4::prefill::workspace_bytes(n_q, n_kv, n_head, n_head_kv, n_seq, head_dim));
+        // DMAIC_PREFILL_K selects the prefill split count without touching the served engine: unset or "1" is
+        // today's k = 1 (no split); "0" asks choose_k() for the wave-arithmetic split count; any other positive
+        // integer is used as k. The workspace is sized for the SAME k: choose_k() is pure, so the sizing here and
+        // launch() (k = 0) compute it identically.
+        int k_prefill = 1;
+        if (const char * k_env = getenv("DMAIC_PREFILL_K")) {
+            const int k_val = atoi(k_env);
+            if (k_val > 0) {
+                k_prefill = k_val;
+            } else if (k_env[0] == '0' && k_env[1] == '\0') {
+                k_prefill = fa_nvfp4::prefill::choose_k(n_q, n_kv, n_head, n_head_kv, n_seq,
+                                                         ggml_cuda_info().devices[ctx.device].nsm,
+                                                         0, head_dim);
+            }
+        }
+        p.k     = k_prefill;
+        p.n_sms = ggml_cuda_info().devices[ctx.device].nsm;
+        ggml_cuda_pool_alloc<char> ws(ctx.pool(), fa_nvfp4::prefill::workspace_bytes(n_q, n_kv, n_head, n_head_kv, n_seq, head_dim, k_prefill));
+        if (k_prefill > 1) {
+            // Split partials sit after the two prepass buffers; same carve as tests/prefill_test.cu:76-80.
+            const size_t nblk   = (size_t) fa_nvfp4::prefill::n_row_blocks(n_q, n_head / (n_head_kv / hpr)) * n_seq;
+            const size_t states = (nblk * fa_nvfp4::prefill::n_kv_tiles(n_kv) + 15) / 16 * 16;
+            p.part_ws = ws.get() + states + (size_t) n_seq * (n_head_kv / hpr) * fa_nvfp4::DBLKS * sizeof(int);
+        }
         CUDA_CHECK(fa_nvfp4::prefill::launch(p, ws.get(), stream));
     }
 }

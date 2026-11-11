@@ -603,6 +603,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     }
 
     ~ggml_cuda_pool_vmm() {
+        // DMAIC_POOL_HW=1: one parseable teardown line, high-water = pool_size (physical VRAM ever committed
+        // by this pool; it only grows and is released here). Unset: no output, no behaviour change.
+        if (getenv("DMAIC_POOL_HW") != nullptr) {
+            fprintf(stderr, "DMAIC_POOL_HW device=%d pool_size_bytes=%zu pool_used_bytes=%zu\n",
+                    device, pool_size, pool_used);
+        }
         if (pool_addr != 0) {
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
