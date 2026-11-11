@@ -2,6 +2,7 @@
 #include "fattn-nvfp4/fa_nvfp4_decode.cuh"
 #include "fattn-nvfp4/fa_nvfp4_prefill.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 
 // Up to this many (query token, head) rows per KV head the split-KV decode kernel is faster than prefill
@@ -10,6 +11,86 @@ static constexpr int NVFP4_DECODE_MAX_ROWS = 448;
 
 static bool nvfp4_strides16(const ggml_tensor * t) {
     return t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
+}
+
+// The prefill split count from DMAIC_PREFILL_K: unset or "1" is k = 1 (no split); "0" asks choose_k(); any other
+// positive integer is used as k. Pure, so the workspace sizing and the launch agree.
+static int nvfp4_prefill_k(int n_q, int n_kv, int n_head, int n_head_kv, int n_seq, int nsm, int head_dim) {
+    static const char * k_env = getenv("DMAIC_PREFILL_K");
+    if (!k_env) {
+        return 1;
+    }
+    const int k_val = atoi(k_env);
+    if (k_val > 0) {
+        return k_val;
+    }
+    if (k_env[0] == '0' && k_env[1] == '\0') {
+        return fa_nvfp4::prefill::choose_k(n_q, n_kv, n_head, n_head_kv, n_seq, nsm, 0, head_dim);
+    }
+    return 1;
+}
+
+// One fixed workspace per device for both attention paths (DMAIC, owner 2026-11-11): the workspace used to come
+// from the CUDA pool, which keeps its largest size for good, so the engine's VRAM grew in steps through the day
+// (+92 MiB served, while the engine was sized at load). Now the first call allocates, once, the most any call can
+// need for this cache: every n_q up to DMAIC_PREFILL_NQ_MAX (the server's -ub; 512, llama.cpp's default, when
+// unset) and every n_kv up to the cache's full size. The pointer never changes (CUDA graphs keep it). A call that
+// needs more (a bigger cache or n_q) takes the pool as before and is logged once.
+static size_t nvfp4_ws_most(int kv_size, int n_head, int n_head_kv, int n_seq, int head_dim, int nsm, int nq_cap) {
+    const int hpr = fa_nvfp4::heads_per_row(head_dim);
+    size_t most = 0;
+    for (int n_q = 1; n_q <= nq_cap; ++n_q) {
+        if (n_q * (n_head / (n_head_kv / hpr)) <= NVFP4_DECODE_MAX_ROWS) {
+            for (int n_kv = fa_nvfp4::prefill::BLOCK_N; n_kv <= kv_size + fa_nvfp4::prefill::BLOCK_N - 1;
+                 n_kv += fa_nvfp4::prefill::BLOCK_N) {
+                const int s = fa_nvfp4::decode::choose_splits(n_kv, n_q, n_head, n_head_kv, n_seq, nsm, 0, head_dim);
+                most = std::max(most, fa_nvfp4::decode::workspace_bytes(n_q, n_head, n_head_kv, n_seq, s, head_dim));
+            }
+            continue;
+        }
+        for (int n_kv = fa_nvfp4::prefill::BLOCK_N; n_kv <= kv_size + fa_nvfp4::prefill::BLOCK_N - 1;
+             n_kv += fa_nvfp4::prefill::BLOCK_N) {
+            const int k = nvfp4_prefill_k(n_q, n_kv, n_head, n_head_kv, n_seq, nsm, head_dim);
+            most = std::max(most, fa_nvfp4::prefill::workspace_bytes(n_q, n_kv, n_head, n_head_kv, n_seq, head_dim, k));
+        }
+    }
+    return most;
+}
+
+static char * nvfp4_fixed_ws(ggml_backend_cuda_context & ctx, const ggml_tensor * K, int n_head, int n_seq,
+                             size_t need) {
+    struct slot { char * p = nullptr; size_t bytes = 0; bool tried = false; bool over_logged = false; };
+    static slot slots[GGML_CUDA_MAX_DEVICES];
+    slot & s = slots[ctx.device];
+    if (!s.tried) {
+        s.tried = true;
+        const ggml_tensor * cache = K->view_src ? K->view_src : K;
+        const int kv_size = (int) cache->ne[1];
+        const char * cap_env = getenv("DMAIC_PREFILL_NQ_MAX");
+        const int nq_cap = cap_env && atoi(cap_env) > 0 ? atoi(cap_env) : 512;
+        const size_t most = nvfp4_ws_most(kv_size, n_head, (int) K->ne[2], n_seq, (int) K->ne[0],
+                                          ggml_cuda_info().devices[ctx.device].nsm, nq_cap);
+        ggml_cuda_set_device(ctx.device);
+        if (most > 0 && cudaMalloc((void **) &s.p, most) == cudaSuccess) {
+            s.bytes = most;
+            GGML_LOG_INFO("DMAIC nvfp4 FA workspace: %.1f MiB fixed (cache %d, n_q <= %d)\n",
+                          most / 1048576.0, kv_size, nq_cap);
+        } else {
+            (void) cudaGetLastError();
+            s.p = nullptr;
+            GGML_LOG_WARN("DMAIC nvfp4 FA workspace: could not allocate %.1f MiB fixed; using the pool\n",
+                          most / 1048576.0);
+        }
+    }
+    if (s.p && need <= s.bytes) {
+        return s.p;
+    }
+    if (s.p && !s.over_logged) {
+        s.over_logged = true;
+        GGML_LOG_WARN("DMAIC nvfp4 FA workspace: a call needs %.1f MiB, over the fixed %.1f MiB; it uses the pool\n",
+                      need / 1048576.0, s.bytes / 1048576.0);
+    }
+    return nullptr;
 }
 
 // Shapes, types and strides only (no data pointers), so the answer is the same when the graph allocator sizes the
@@ -94,8 +175,13 @@ void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor
         p.head_dim = head_dim;
         p.n_splits = fa_nvfp4::decode::choose_splits(n_kv, n_q, n_head, n_head_kv, n_seq, ggml_cuda_info().devices[ctx.device].nsm,
                                                      0, head_dim);
-        ggml_cuda_pool_alloc<char> ws(ctx.pool(), fa_nvfp4::decode::workspace_bytes(n_q, n_head, n_head_kv, n_seq, p.n_splits, head_dim));
-        CUDA_CHECK(fa_nvfp4::decode::launch(p, ws.get(), stream));
+        const size_t need = fa_nvfp4::decode::workspace_bytes(n_q, n_head, n_head_kv, n_seq, p.n_splits, head_dim);
+        ggml_cuda_pool_alloc<char> pool_ws(ctx.pool());
+        char * ws = nvfp4_fixed_ws(ctx, K, n_head, n_seq, need);
+        if (!ws) {
+            ws = pool_ws.alloc(need);
+        }
+        CUDA_CHECK(fa_nvfp4::decode::launch(p, ws, stream));
     } else {
         fa_nvfp4::prefill::Params p{};
         p.Q = (const float *) Q->data;   p.nbq1 = Q->nb[1]; p.nbq2 = Q->nb[2]; p.nbq3 = Q->nb[3];
@@ -107,30 +193,22 @@ void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor
         p.scale = scale;
         p.softcap = logit_softcap;
         p.head_dim = head_dim;
-        // DMAIC_PREFILL_K selects the prefill split count without touching the served engine: unset or "1" is
-        // today's k = 1 (no split); "0" asks choose_k() for the wave-arithmetic split count; any other positive
-        // integer is used as k. The workspace is sized for the SAME k: choose_k() is pure, so the sizing here and
-        // launch() (k = 0) compute it identically.
-        int k_prefill = 1;
-        if (const char * k_env = getenv("DMAIC_PREFILL_K")) {
-            const int k_val = atoi(k_env);
-            if (k_val > 0) {
-                k_prefill = k_val;
-            } else if (k_env[0] == '0' && k_env[1] == '\0') {
-                k_prefill = fa_nvfp4::prefill::choose_k(n_q, n_kv, n_head, n_head_kv, n_seq,
-                                                         ggml_cuda_info().devices[ctx.device].nsm,
-                                                         0, head_dim);
-            }
-        }
+        const int k_prefill = nvfp4_prefill_k(n_q, n_kv, n_head, n_head_kv, n_seq,
+                                              ggml_cuda_info().devices[ctx.device].nsm, head_dim);
         p.k     = k_prefill;
         p.n_sms = ggml_cuda_info().devices[ctx.device].nsm;
-        ggml_cuda_pool_alloc<char> ws(ctx.pool(), fa_nvfp4::prefill::workspace_bytes(n_q, n_kv, n_head, n_head_kv, n_seq, head_dim, k_prefill));
+        const size_t need = fa_nvfp4::prefill::workspace_bytes(n_q, n_kv, n_head, n_head_kv, n_seq, head_dim, k_prefill);
+        ggml_cuda_pool_alloc<char> pool_ws(ctx.pool());
+        char * ws = nvfp4_fixed_ws(ctx, K, n_head, n_seq, need);
+        if (!ws) {
+            ws = pool_ws.alloc(need);
+        }
         if (k_prefill > 1) {
             // Split partials sit after the two prepass buffers; same carve as tests/prefill_test.cu:76-80.
             const size_t nblk   = (size_t) fa_nvfp4::prefill::n_row_blocks(n_q, n_head / (n_head_kv / hpr)) * n_seq;
             const size_t states = (nblk * fa_nvfp4::prefill::n_kv_tiles(n_kv) + 15) / 16 * 16;
-            p.part_ws = ws.get() + states + (size_t) n_seq * (n_head_kv / hpr) * fa_nvfp4::DBLKS * sizeof(int);
+            p.part_ws = ws + states + (size_t) n_seq * (n_head_kv / hpr) * fa_nvfp4::DBLKS * sizeof(int);
         }
-        CUDA_CHECK(fa_nvfp4::prefill::launch(p, ws.get(), stream));
+        CUDA_CHECK(fa_nvfp4::prefill::launch(p, ws, stream));
     }
 }
