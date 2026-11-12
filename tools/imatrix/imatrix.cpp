@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -728,6 +729,31 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
                     if (act) {
                         for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                    }
+                }
+            }
+        }
+
+        // DMAIC: raw input activations of tensors matching $IMX_DUMP_RE, fp16 rows, up to $IMX_DUMP_MAX per tensor
+        {
+            static const char * re_s = getenv("IMX_DUMP_RE");
+            if (re_s) {
+                static const std::regex re(re_s);
+                static const std::string dir = getenv("IMX_DUMP_DIR") ? getenv("IMX_DUMP_DIR") : ".";
+                static const int64_t maxr = getenv("IMX_DUMP_MAX") ? atoll(getenv("IMX_DUMP_MAX")) : 65536;
+                static std::unordered_map<std::string, int64_t> dumped;
+                if (std::regex_search(wname, re) && dumped[wname] < maxr) {
+                    std::ofstream f(dir + "/" + wname + ".f16", std::ios::binary | std::ios::app);
+                    std::vector<ggml_fp16_t> buf(ne0);
+                    for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+                        for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+                            for (int64_t row = 0; row < src1->ne[1] && dumped[wname] < maxr; ++row) {
+                                const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                                ggml_fp32_to_fp16_row(x, buf.data(), ne0);
+                                f.write((const char *) buf.data(), ne0 * sizeof(ggml_fp16_t));
+                                dumped[wname]++;
+                            }
+                        }
                     }
                 }
             }
