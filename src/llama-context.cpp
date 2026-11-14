@@ -3373,6 +3373,14 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
+        flush_batched();
+        // rows decoded outside the state buffer (packed NVFP4 KV, DMAIC): written one by one after the batch
+        for (const auto & e : einfos) {
+            ggml_backend_tensor_set(e.tensor, e.ptr, e.offset, e.size);
+        }
+    }
+
+    void flush_batched() {
         if (rinfos.empty()) {
             return;
         }
@@ -3431,12 +3439,13 @@ public:
     }
 
     void set_tensor(ggml_tensor * tensor, size_t offset, const uint8_t * data, size_t size, std::shared_ptr<void> keep) override {
-        rinfos.push_back({tensor, data, size, offset});
+        einfos.push_back({tensor, data, size, offset});
         keeps.push_back(std::move(keep));
     }
 
     void discard() override {
         rinfos.clear();
+        einfos.clear();
         keeps.clear();
     }
 
@@ -3457,6 +3466,13 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+    struct ext_info {
+        ggml_tensor * tensor;
+        const uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<ext_info> einfos;
     std::vector<std::shared_ptr<void>> keeps; // keeps set_tensor data alive until the flush
 };
 
