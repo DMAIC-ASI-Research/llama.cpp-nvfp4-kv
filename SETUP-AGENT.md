@@ -90,7 +90,7 @@ A desktop on the same GPU typically uses 0.3-1.5 GB; that is fine, but it lowers
 ```bash
 cd $WORK
 llama.cpp-nvfp4-kv/build/bin/llama-server -m models/Qwen3.8-27B-DMAIC_ASI-S16.gguf \
-  -ngl 99 -c 120064 -fa on -ctk nvfp4 -ctv nvfp4 -b 2048 -ub 256 -np 1 -kvu \
+  -ngl 99 -c 120064 --fit off -fa on -ctk nvfp4 -ctv nvfp4 -b 2048 -ub 256 -np 1 -kvu \
   --spec-type draft-mtp,ngram-simple -ctkd nvfp4 -ctvd nvfp4 --spec-draft-n-ubatch 64 \
   --host 127.0.0.1 --port 8080 > server.log 2>&1 &
 ```

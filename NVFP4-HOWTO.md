@@ -61,7 +61,7 @@ hf download DMAIC-ASI/Qwen3.8-27B-DMAIC_ASI-S16-GGUF Qwen3.8-27B-DMAIC_ASI-S16.g
 
 ```bash
 build/bin/llama-server -m models/Qwen3.8-27B-DMAIC_ASI-S16.gguf \
-  -ngl 99 -c 120064 -fa on -ctk nvfp4 -ctv nvfp4 -b 2048 -ub 256 -np 1 -kvu \
+  -ngl 99 -c 120064 --fit off -fa on -ctk nvfp4 -ctv nvfp4 -b 2048 -ub 256 -np 1 -kvu \
   --spec-type draft-mtp,ngram-simple -ctkd nvfp4 -ctvd nvfp4 --spec-draft-n-ubatch 64 \
   --host 127.0.0.1 --port 8080
 ```
@@ -74,6 +74,7 @@ What the flags do:
   error (a desktop on the same GPU takes some memory), lower it in steps of 8192.
 - `--spec-type draft-mtp,ngram-simple`: speculative decoding with the model's own multi-token-prediction head, plus
   n-gram lookup. `-ctkd/-ctvd nvfp4` keep the draft's cache in NVFP4 too. Remove these four flags to run without it.
+- `--fit off`: use the settings as given (llama.cpp's auto-fit would otherwise warn and give up, since `-ngl` is set).
 - `-ub 256`, `--spec-draft-n-ubatch 64`: the batch sizes that fit with the full context.
 
 ## Quality
