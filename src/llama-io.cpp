@@ -1,5 +1,7 @@
 #include "llama-io.h"
 
+#include "ggml-backend.h"
+
 #include <vector>
 
 void llama_io_write_i::write_string(const std::string & str) {
@@ -7,6 +9,11 @@ void llama_io_write_i::write_string(const std::string & str) {
 
     write(&str_size,  sizeof(str_size));
     write(str.data(), str_size);
+}
+
+void llama_io_read_i::set_tensor(ggml_tensor * tensor, size_t offset, const uint8_t * data, size_t size, std::shared_ptr<void> keep) {
+    ggml_backend_tensor_set(tensor, data, offset, size);
+    (void) keep;
 }
 
 void llama_io_read_i::read_string(std::string & str) {

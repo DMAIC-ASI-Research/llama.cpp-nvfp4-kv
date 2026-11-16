@@ -3286,6 +3286,10 @@ public:
         return size_written;
     }
 
+    bool size_only() const override {
+        return true;
+    }
+
 private:
     const bool skip_tensors;
 
@@ -3369,6 +3373,14 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
+        flush_batched();
+        // rows decoded outside the state buffer (packed NVFP4 KV): written one by one after the batch
+        for (const auto & e : einfos) {
+            ggml_backend_tensor_set(e.tensor, e.ptr, e.offset, e.size);
+        }
+    }
+
+    void flush_batched() {
         if (rinfos.empty()) {
             return;
         }
@@ -3415,8 +3427,26 @@ public:
         buf_size -= size;
     }
 
+    const uint8_t * read_ptr(size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        const uint8_t * p = ptr;
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+        return p;
+    }
+
+    void set_tensor(ggml_tensor * tensor, size_t offset, const uint8_t * data, size_t size, std::shared_ptr<void> keep) override {
+        einfos.push_back({tensor, data, size, offset});
+        keeps.push_back(std::move(keep));
+    }
+
     void discard() override {
         rinfos.clear();
+        einfos.clear();
+        keeps.clear();
     }
 
     size_t n_bytes() override {
@@ -3436,6 +3466,14 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+    struct ext_info {
+        ggml_tensor * tensor;
+        const uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<ext_info> einfos;
+    std::vector<std::shared_ptr<void>> keeps; // keeps set_tensor data alive until the flush
 };
 
 class llama_io_write_file : public llama_io_write_i {

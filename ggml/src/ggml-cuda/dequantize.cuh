@@ -57,6 +57,19 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
     v.y = (v.y - 8.0f) * d;
 }
 
+// For dequantize_block with qk = 64, qr = 2: v.x = element iqs, v.y = element iqs + 32 of block ib.
+static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+
+    const int s   = iqs / QK_NVFP4_SUB;
+    const int pos = iqs % QK_NVFP4_SUB;
+    const int sh  = 4 * (pos / (QK_NVFP4_SUB/2));
+    const int j   = pos % (QK_NVFP4_SUB/2);
+
+    v.x = ggml_cuda_ue4m3_to_fp32(x[ib].d[s])     * kvalues_mxfp4[(x[ib].qs[ s     *(QK_NVFP4_SUB/2) + j] >> sh) & 0x0F];
+    v.y = ggml_cuda_ue4m3_to_fp32(x[ib].d[s + 2]) * kvalues_mxfp4[(x[ib].qs[(s + 2)*(QK_NVFP4_SUB/2) + j] >> sh) & 0x0F];
+}
+
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_1 * x = (const block_q4_1 *) vx;
 

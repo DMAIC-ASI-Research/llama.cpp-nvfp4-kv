@@ -211,6 +211,162 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+// Device ports of ggml_fp32_to_ue4m3 and quantize_row_nvfp4_ref (with its scale search), bit-exact with the CPU
+// reference.
+static __device__ __forceinline__ uint8_t nvfp4_fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+    const uint32_t bits = __float_as_uint(x);
+    const int fp32_exp  = int((bits >> 23) & 0xFF) - 127;
+    const int fp32_man  = (bits >> 20) & 0x7;
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        int man = (int) __fadd_rn(__fmul_rn(x, 512.0f), 0.5f);
+        man = man > 7 ? 7 : man;
+        return man < 1 ? 0 : (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    int ue4m3_man = fp32_man + int((bits >> 19) & 1);
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
+        }
+    }
+    return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// Same as best_index_mxfp4 on the CPU.
+static __device__ __forceinline__ uint8_t nvfp4_best_index(const float x, const float e) {
+    int   best_index = 0;
+    float best_err   = fabsf(__fsub_rn(__fmul_rn((float) kvalues_mxfp4[0], e), x));
+#pragma unroll
+    for (int i = 1; i < 16; ++i) {
+        const float err = fabsf(__fsub_rn(__fmul_rn((float) kvalues_mxfp4[i], e), x));
+        if (err < best_err) {
+            best_index = i;
+            best_err   = err;
+        }
+    }
+    return (uint8_t) best_index;
+}
+
+// Same as nvfp4_sub_sse / nvfp4_best_scale on the CPU (scale search "M3"): the UE4M3 codes bracketing amax/6,
+// amax/5 and amax/4, the smallest squared error wins; squares in double, added in the CPU's tree order. Used by
+// ggml_cpy; the KV-cache write is the parallel k_set_rows_nvfp4 in set-rows.cu, which gives the same bytes.
+static __device__ __forceinline__ double nvfp4_sub_sse(const float (&xs)[QK_NVFP4_SUB], const uint8_t ue) {
+    const float d = ggml_cuda_ue4m3_to_fp32(ue);
+    double sq[QK_NVFP4_SUB];
+#pragma unroll
+    for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+        const float e = __fsub_rn(xs[j], __fmul_rn((float) kvalues_mxfp4[nvfp4_best_index(xs[j], d)], d));
+        sq[j] = __dmul_rn((double) e, (double) e);
+    }
+#pragma unroll
+    for (int o = QK_NVFP4_SUB/2; o > 0; o >>= 1) {
+#pragma unroll
+        for (int j = 0; j < o; ++j) {
+            sq[j] = __dadd_rn(sq[j], sq[j + o]);
+        }
+    }
+    return sq[0];
+}
+
+static __device__ __forceinline__ uint8_t nvfp4_best_scale(const float (&xs)[QK_NVFP4_SUB], const float amax) {
+    const float divs[3] = { 6.0f, 5.0f, 4.0f };
+    uint8_t best_ue  = 0;
+    double  best_sse = (double) INFINITY;
+#pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        const float   t  = __fdiv_rn(amax, divs[c]);
+        const uint8_t rn = nvfp4_fp32_to_ue4m3(t);
+        const float   v  = 2.0f*ggml_cuda_ue4m3_to_fp32(rn);
+        uint8_t lo = rn, hi = rn;
+        if (v > t) {
+            lo = rn > 0 ? rn - 1 : 0;
+        } else if (v < t) {
+            hi = rn < 0x7E ? rn + 1 : 0x7E;
+        }
+        const uint8_t cand[2] = { lo, hi };
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const double sse = nvfp4_sub_sse(xs, cand[k]);
+            if (sse < best_sse) {
+                best_sse = sse;
+                best_ue  = cand[k];
+            }
+        }
+    }
+    return best_ue;
+}
+
+template <typename src_t>
+static __device__ void quantize_nvfp4_block(const src_t * __restrict__ x, block_nvfp4 * __restrict__ y) {
+#pragma unroll
+    for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; ++s) {
+        float xs[QK_NVFP4_SUB];
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+            xs[j] = ggml_cuda_cast<float>(x[s*QK_NVFP4_SUB + j]);
+            amax  = fmaxf(amax, fabsf(xs[j]));
+        }
+        const uint8_t ue = nvfp4_best_scale(xs, amax);
+        y->d[s] = ue;
+        const float d = ggml_cuda_ue4m3_to_fp32(ue);
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+            y->qs[s*(QK_NVFP4_SUB/2) + j] =
+                nvfp4_best_index(xs[j], d) | (nvfp4_best_index(xs[j + QK_NVFP4_SUB/2], d) << 4);
+        }
+    }
+}
+
+static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    quantize_nvfp4_block(x, y);
+}
+
+static __device__ void quantize_f16_nvfp4_block(const half * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    quantize_nvfp4_block(x, y);
+}
+
+template <typename dst_t>
+static __device__ void dequantize_nvfp4_block(const block_nvfp4 * __restrict__ x, dst_t * __restrict__ y) {
+#pragma unroll
+    for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; ++s) {
+        const float d = ggml_cuda_ue4m3_to_fp32(x->d[s]);
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+            const uint8_t q = x->qs[s*(QK_NVFP4_SUB/2) + j];
+            y[s*QK_NVFP4_SUB + j]                  = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
+            y[s*QK_NVFP4_SUB + j + QK_NVFP4_SUB/2] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
+        }
+    }
+}
+
+static __device__ void cpy_blck_f32_nvfp4(const char * cxi, char * cdsti) {
+    quantize_f32_nvfp4_block((const float *) cxi, (block_nvfp4 *) cdsti);
+}
+
+static __device__ void cpy_blck_f16_nvfp4(const char * cxi, char * cdsti) {
+    quantize_f16_nvfp4_block((const half *) cxi, (block_nvfp4 *) cdsti);
+}
+
+static __device__ void cpy_blck_nvfp4_f32(const char * cxi, char * cdsti) {
+    dequantize_nvfp4_block((const block_nvfp4 *) cxi, (float *) cdsti);
+}
+
+static __device__ void cpy_blck_nvfp4_f16(const char * cxi, char * cdsti) {
+    dequantize_nvfp4_block((const block_nvfp4 *) cxi, (half *) cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

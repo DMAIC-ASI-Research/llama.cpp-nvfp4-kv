@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-nvfp4.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -535,6 +536,8 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(BF16, F8_E4M3)
     FATTN_VEC_CASES_ALL_D(F8_E4M3, F8_E4M3)
 
+    FATTN_VEC_CASES_ALL_D(NVFP4, NVFP4)
+
     return nullptr;
 }
 
@@ -578,6 +581,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_F8_E4M3:
+        case GGML_TYPE_NVFP4:
             return true;
         default:
             return false;
@@ -790,6 +794,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+    if (ggml_cuda_flash_attn_ext_nvfp4_usable(device, dst)) {
+        return ggml_nbytes(dst);   // the native NVFP4 kernels read the cache directly: no f16 copies of K and V
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -818,6 +826,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_flash_attn_ext_nvfp4_usable(ctx.device, dst)) {
+        // the output was sized without f16 K/V copies; the vector kernel reads NVFP4 directly and needs none either
+        if (ggml_cuda_flash_attn_ext_nvfp4_aligned(dst)) {
+            ggml_cuda_flash_attn_ext_nvfp4(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        }
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
