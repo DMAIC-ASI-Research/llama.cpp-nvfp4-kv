@@ -1,3 +1,10 @@
+# This fork: NVFP4 KV cache
+
+If you were asked to **set up or run** the Qwen3.8-27B-DMAIC_ASI-S16 model or this NVFP4 KV build, follow
+[SETUP-AGENT.md](SETUP-AGENT.md). The rest of this file is upstream llama.cpp's guide for contributors.
+
+---
+
 # Instructions for llama.cpp
 
 > [!IMPORTANT]

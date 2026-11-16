@@ -1,3 +1,8 @@
+> **This is a fork of llama.cpp with an NVFP4 KV cache and native FlashAttention for RTX 50-series GPUs.**
+> How to build and run it: [NVFP4-HOWTO.md](NVFP4-HOWTO.md). For an AI assistant doing the setup:
+> [SETUP-AGENT.md](SETUP-AGENT.md). Model: [Qwen3.8-27B-DMAIC_ASI-S16](https://huggingface.co/DMAIC-ASI/Qwen3.8-27B-DMAIC_ASI-S16-GGUF).
+> Everything below is upstream llama.cpp's README.
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
