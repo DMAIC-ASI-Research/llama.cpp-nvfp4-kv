@@ -54,13 +54,13 @@ The CUDA build takes a while (tens of minutes on a 10-thread CPU). When it ends,
 
 ```bash
 pip install -U huggingface_hub
-hf download DMAIC-ASI/Qwen3.8-27B-DMAIC_ASI-S16-GGUF Qwen3.8-27B-DMAIC_ASI-S16.gguf --local-dir models
+hf download DMAIC-ASI/Qwen3.8-27B-DMAIC_ASI-S16-GGUF Qwen3.8-27B-DMAIC_ASI-S16-Q3_K_XL.gguf --local-dir models
 ```
 
 ## 3. Run
 
 ```bash
-build/bin/llama-server -m models/Qwen3.8-27B-DMAIC_ASI-S16.gguf \
+build/bin/llama-server -m models/Qwen3.8-27B-DMAIC_ASI-S16-Q3_K_XL.gguf \
   -ngl 99 -c 120064 --fit off -fa on -ctk nvfp4 -ctv nvfp4 -b 2048 -ub 256 -np 1 -kvu \
   --spec-type draft-mtp,ngram-simple -ctkd nvfp4 -ctvd nvfp4 --spec-draft-n-ubatch 64 \
   --host 127.0.0.1 --port 8080
